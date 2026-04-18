@@ -232,6 +232,7 @@ def parse_log_records(files, progress_bar=None):
                     'codeReferenceEvents': resp.get('codeReferenceEvents', []),
                     'supplementaryWebLinks': resp.get('supplementaryWebLinksEvent', []),
                     'requestId': resp.get('requestId', ''),
+                    '_raw_record': rec,  # preserve the complete original record
                 })
 
     df_inline = pd.DataFrame(inline_rows) if inline_rows else pd.DataFrame()
@@ -1470,21 +1471,28 @@ def _render_raw_data_tab(df_chat, theme_colors, display_name_map):
         label = f"📋 {ts_str} — {display_user} — {len(messages_sorted)} msgs — Session: {cid}"
 
         with st.expander(label, expanded=False):
-            # Session-level raw JSON export
+            # Session-level raw JSON export — use original records from S3
             session_records = []
             for msg in messages_sorted:
-                record = {}
-                for col in msg.index:
-                    val = msg[col]
-                    if pd.isna(val):
-                        record[col] = None
-                    elif hasattr(val, 'isoformat'):
-                        record[col] = val.isoformat()
-                    elif isinstance(val, (list, dict)):
-                        record[col] = val
-                    else:
-                        record[col] = str(val)
-                session_records.append(record)
+                raw = msg.get('_raw_record')
+                if raw and isinstance(raw, dict):
+                    session_records.append(raw)
+                else:
+                    # Fallback: serialize the parsed row (shouldn't normally happen)
+                    record = {}
+                    for col in msg.index:
+                        if col == '_raw_record':
+                            continue
+                        val = msg[col]
+                        if pd.isna(val):
+                            record[col] = None
+                        elif hasattr(val, 'isoformat'):
+                            record[col] = val.isoformat()
+                        elif isinstance(val, (list, dict)):
+                            record[col] = val
+                        else:
+                            record[col] = str(val)
+                    session_records.append(record)
 
             # Download button for this session
             session_json = json.dumps(session_records, indent=2, ensure_ascii=False)
@@ -1543,5 +1551,11 @@ def _render_raw_data_tab(df_chat, theme_colors, display_name_map):
                 if extra:
                     with st.popover("📎 其他字段"):
                         st.json(extra)
+
+                # Full original record from S3
+                raw = msg.get('_raw_record')
+                if raw and isinstance(raw, dict):
+                    with st.popover("🗂️ 查看原始 JSON"):
+                        st.json(raw)
 
                 st.markdown("<hr style='margin:8px 0;opacity:0.15;'>", unsafe_allow_html=True)
