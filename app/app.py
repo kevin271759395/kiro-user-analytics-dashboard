@@ -159,7 +159,31 @@ def get_username(userid):
 
 @st.cache_data(ttl=3600)
 def get_usernames_batch(userids):
-    return {uid: get_username(uid) for uid in userids}
+    """Batch-resolve userIds to friendly display names.
+
+    When two different userIds resolve to the same username, disambiguate
+    by appending the last 4 characters of the userId in parentheses.
+    """
+    from collections import Counter
+
+    unique_ids = list(set(userids))
+
+    # Step 1: resolve each userId to a raw username
+    raw_map = {uid: get_username(uid) for uid in unique_ids}
+
+    # Step 2: detect duplicate usernames
+    name_counts = Counter(raw_map.values())
+
+    # Step 3: append short ID suffix for duplicates
+    display_map = {}
+    for uid, name in raw_map.items():
+        if name_counts[name] > 1 and name != uid:
+            short_id = uid.split('.')[-1][-4:] if '.' in uid else uid[-4:]
+            display_map[uid] = f"{name} ({short_id})"
+        else:
+            display_map[uid] = name
+
+    return display_map
 
 def execute_athena_query(query):
     client = get_athena_client()

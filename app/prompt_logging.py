@@ -344,6 +344,45 @@ def _render_code_block(code, filename='', theme_colors=None):
     """, unsafe_allow_html=True)
 
 
+# ── Display name helpers ────────────────────────────────────────────
+
+def _build_display_name_map(user_ids, get_username_fn):
+    """Batch-resolve userIds to friendly display names.
+
+    When two different userIds resolve to the same username, disambiguate
+    by appending the last 4 characters of the userId in parentheses.
+    Returns a dict {userId: display_name}.
+    """
+    if not user_ids:
+        return {}
+
+    unique_ids = list(set(user_ids))
+    from collections import Counter
+
+    # Step 1: resolve each userId to a raw username
+    raw_map = {}
+    for uid in unique_ids:
+        if get_username_fn:
+            raw_map[uid] = get_username_fn(uid)
+        else:
+            raw_map[uid] = uid
+
+    # Step 2: detect duplicate usernames
+    name_counts = Counter(raw_map.values())
+
+    # Step 3: build final display names — append short ID suffix for duplicates
+    display_map = {}
+    for uid, name in raw_map.items():
+        if name_counts[name] > 1 and name != uid:
+            # Use last 4 chars of the userId portion (after the dot if present)
+            short_id = uid.split('.')[-1][-4:] if '.' in uid else uid[-4:]
+            display_map[uid] = f"{name} ({short_id})"
+        else:
+            display_map[uid] = name
+
+    return display_map
+
+
 # ── Main page renderer ─────────────────────────────────────────────
 
 def render_prompt_logging_page(apply_chart_theme_fn, chart_colors, theme_colors, get_username_fn=None):
@@ -460,6 +499,14 @@ def render_prompt_logging_page(apply_chart_theme_fn, chart_colors, theme_colors,
 
     st.markdown("---")
 
+    # ── Resolve display names for all users ──
+    all_user_ids = set()
+    if not df_inline.empty:
+        all_user_ids.update(df_inline['userId'].dropna().unique())
+    if not df_chat.empty:
+        all_user_ids.update(df_chat['userId'].dropna().unique())
+    display_name_map = _build_display_name_map(list(all_user_ids), get_username_fn)
+
     # ── Tab navigation ──
     tab_chat, tab_inline, tab_timeline = st.tabs([
         "💬 Chat Conversations", "⚡ Inline Suggestions", "📊 Activity Timeline"
@@ -470,28 +517,28 @@ def render_prompt_logging_page(apply_chart_theme_fn, chart_colors, theme_colors,
     # ══════════════════════════════════════════════════════════════
     with tab_chat:
         _render_chat_tab(df_chat, search_query, apply_chart_theme_fn,
-                         chart_colors, theme_colors, get_username_fn)
+                         chart_colors, theme_colors, display_name_map)
 
     # ══════════════════════════════════════════════════════════════
     # TAB 2: Inline Suggestions
     # ══════════════════════════════════════════════════════════════
     with tab_inline:
         _render_inline_tab(df_inline, search_query, apply_chart_theme_fn,
-                           chart_colors, theme_colors, get_username_fn)
+                           chart_colors, theme_colors, display_name_map)
 
     # ══════════════════════════════════════════════════════════════
     # TAB 3: Activity Timeline
     # ══════════════════════════════════════════════════════════════
     with tab_timeline:
         _render_timeline_tab(df_inline, df_chat, apply_chart_theme_fn,
-                             chart_colors, theme_colors)
+                             chart_colors, theme_colors, display_name_map)
 
 
 
 # ── Chat tab ────────────────────────────────────────────────────────
 
 def _render_chat_tab(df_chat, search_query, apply_chart_theme_fn,
-                     chart_colors, theme_colors, get_username_fn):
+                     chart_colors, theme_colors, display_name_map):
     if df_chat.empty:
         st.info("No chat log records found in the selected date range.")
         return
@@ -512,18 +559,25 @@ def _render_chat_tab(df_chat, search_query, apply_chart_theme_fn,
             return
 
     # ── Sidebar filters ──
+    # Build user filter with display names
+    raw_user_ids = sorted(df['userId'].dropna().unique().tolist())
+    user_display_options = {uid: display_name_map.get(uid, uid) for uid in raw_user_ids}
+    user_labels = ['All'] + [user_display_options[uid] for uid in raw_user_ids]
+    # Reverse lookup: display_name → userId
+    display_to_uid = {v: k for k, v in user_display_options.items()}
+
     fc1, fc2, fc3 = st.columns(3)
     with fc1:
-        users = ['All'] + sorted(df['userId'].dropna().unique().tolist())
-        sel_user = st.selectbox("User", users, key='chat_user_filter')
+        sel_user_label = st.selectbox("User", user_labels, key='chat_user_filter')
     with fc2:
         triggers = ['All'] + sorted(df['chatTriggerType'].dropna().unique().tolist())
         sel_trigger = st.selectbox("Trigger Type", triggers, key='chat_trigger_filter')
     with fc3:
         st.metric("Conversations", df['conversationId'].nunique())
 
-    if sel_user != 'All':
-        df = df[df['userId'] == sel_user]
+    if sel_user_label != 'All':
+        sel_user_id = display_to_uid.get(sel_user_label, sel_user_label)
+        df = df[df['userId'] == sel_user_id]
     if sel_trigger != 'All':
         df = df[df['chatTriggerType'] == sel_trigger]
 
@@ -563,7 +617,7 @@ def _render_chat_tab(df_chat, search_query, apply_chart_theme_fn,
         first_ts = messages_sorted[0]['timestamp']
         last_ts = messages_sorted[-1]['timestamp']
         user_id = messages_sorted[0]['userId']
-        display_user = get_username_fn(user_id) if get_username_fn else user_id
+        display_user = display_name_map.get(user_id, user_id)
         ts_str = first_ts.strftime('%Y-%m-%d %H:%M') if pd.notna(first_ts) else '?'
         first_prompt = _truncate(messages_sorted[0].get('prompt', ''), 80)
 
@@ -628,7 +682,7 @@ def _render_chat_tab(df_chat, search_query, apply_chart_theme_fn,
 # ── Inline suggestions tab ──────────────────────────────────────────
 
 def _render_inline_tab(df_inline, search_query, apply_chart_theme_fn,
-                       chart_colors, theme_colors, get_username_fn):
+                       chart_colors, theme_colors, display_name_map):
     if df_inline.empty:
         st.info("No inline suggestion records found in the selected date range.")
         return
@@ -648,19 +702,24 @@ def _render_inline_tab(df_inline, search_query, apply_chart_theme_fn,
             st.warning(f"No inline suggestion records match '{search_query}'")
             return
 
-    # Filters
+    # Filters — use display names
+    raw_user_ids = sorted(df['userId'].dropna().unique().tolist())
+    user_display_options = {uid: display_name_map.get(uid, uid) for uid in raw_user_ids}
+    user_labels = ['All'] + [user_display_options[uid] for uid in raw_user_ids]
+    display_to_uid = {v: k for k, v in user_display_options.items()}
+
     fc1, fc2, fc3 = st.columns(3)
     with fc1:
-        users = ['All'] + sorted(df['userId'].dropna().unique().tolist())
-        sel_user = st.selectbox("User", users, key='inline_user_filter')
+        sel_user_label = st.selectbox("User", user_labels, key='inline_user_filter')
     with fc2:
         fnames = ['All'] + sorted(df['fileName'].dropna().unique().tolist())
         sel_file = st.selectbox("File Name", fnames, key='inline_file_filter')
     with fc3:
         st.metric("Total Suggestions", len(df))
 
-    if sel_user != 'All':
-        df = df[df['userId'] == sel_user]
+    if sel_user_label != 'All':
+        sel_user_id = display_to_uid.get(sel_user_label, sel_user_label)
+        df = df[df['userId'] == sel_user_id]
     if sel_file != 'All':
         df = df[df['fileName'] == sel_file]
 
@@ -697,7 +756,7 @@ def _render_inline_tab(df_inline, search_query, apply_chart_theme_fn,
     for _, row in page_df.iterrows():
         ts_str = row['timestamp'].strftime('%Y-%m-%d %H:%M:%S') if pd.notna(row['timestamp']) else '?'
         user_id = row['userId']
-        display_user = get_username_fn(user_id) if get_username_fn else user_id
+        display_user = display_name_map.get(user_id, user_id)
         fname = row.get('fileName', '')
         completions = row.get('completions', [])
         completion_text = completions[0] if completions else ''
@@ -751,7 +810,7 @@ def _guess_language(filename):
 # ── Timeline tab ────────────────────────────────────────────────────
 
 def _render_timeline_tab(df_inline, df_chat, apply_chart_theme_fn,
-                         chart_colors, theme_colors):
+                         chart_colors, theme_colors, display_name_map=None):
     """Render combined activity timeline charts."""
 
     has_inline = not df_inline.empty
@@ -845,11 +904,19 @@ def _render_timeline_tab(df_inline, df_chat, apply_chart_theme_fn,
     df_user_totals = df_user_totals.nlargest(15, 'count')
 
     df_user_top = df_user_activity[df_user_activity['userId'].isin(df_user_totals['userId'])]
-    fig_users = px.bar(df_user_top, x='userId', y='count', color='type',
+    # Map userId to display names
+    if display_name_map:
+        df_user_top = df_user_top.copy()
+        df_user_top['displayName'] = df_user_top['userId'].map(
+            lambda uid: display_name_map.get(uid, uid))
+    else:
+        df_user_top = df_user_top.copy()
+        df_user_top['displayName'] = df_user_top['userId']
+    fig_users = px.bar(df_user_top, x='displayName', y='count', color='type',
                        title='Top 15 Users by Prompt Log Activity',
                        barmode='stack',
                        color_discrete_sequence=['#4361ee', '#f72585'],
-                       labels={'count': 'Records', 'userId': 'User', 'type': 'Type'})
+                       labels={'count': 'Records', 'displayName': 'User', 'type': 'Type'})
     fig_users.update_traces(marker_line_width=0)
     fig_users.update_layout(xaxis_tickangle=-45)
     apply_chart_theme_fn(fig_users)
