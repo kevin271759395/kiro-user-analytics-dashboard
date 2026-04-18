@@ -223,6 +223,7 @@ def parse_log_records(files, progress_bar=None):
                     'timestamp': req.get('timeStamp', ''),
                     'prompt': req.get('prompt', ''),
                     'chatTriggerType': req.get('chatTriggerType', ''),
+                    'modelId': req.get('modelId', ''),
                     'customizationArn': req.get('customizationArn'),
                     'assistantResponse': resp.get('assistantResponse', ''),
                     'followupPrompts': resp.get('followupPrompts', ''),
@@ -535,6 +536,87 @@ def render_prompt_logging_page(apply_chart_theme_fn, chart_colors, theme_colors,
 
 
 
+# ── Model top chart ────────────────────────────────────────────────
+
+def _render_model_top_chart(df_chat, apply_chart_theme_fn, chart_colors, theme_colors):
+    """Render model usage ranking chart with session-level breakdown."""
+    if df_chat.empty or 'modelId' not in df_chat.columns:
+        st.info("No model information available.")
+        return
+
+    df = df_chat.copy()
+    df['modelId'] = df['modelId'].fillna('').replace('', 'unknown')
+
+    col1, col2 = st.columns([3, 2])
+
+    with col1:
+        # Overall model usage bar chart
+        model_counts = df['modelId'].value_counts().reset_index()
+        model_counts.columns = ['modelId', 'messages']
+        fig_model = px.bar(
+            model_counts, x='messages', y='modelId', orientation='h',
+            title='Messages by Model',
+            color='messages', color_continuous_scale='Blues',
+            labels={'messages': 'Messages', 'modelId': 'Model'},
+        )
+        fig_model.update_traces(marker_line_width=0)
+        fig_model.update_layout(
+            yaxis={'categoryorder': 'total ascending'},
+            coloraxis_showscale=False,
+            height=max(200, len(model_counts) * 40 + 80),
+        )
+        apply_chart_theme_fn(fig_model)
+        st.plotly_chart(fig_model, use_container_width=True)
+
+    with col2:
+        # Model usage per session (conversationId)
+        if 'conversationId' in df.columns:
+            session_model = (
+                df.groupby(['conversationId', 'modelId'])
+                .size()
+                .reset_index(name='count')
+            )
+            # Pivot: sessions as rows, models as columns
+            pivot = session_model.pivot_table(
+                index='conversationId', columns='modelId',
+                values='count', fill_value=0
+            ).reset_index()
+
+            # Show top 10 sessions by total messages
+            pivot['_total'] = pivot.drop(columns='conversationId').sum(axis=1)
+            pivot = pivot.nlargest(10, '_total').drop(columns='_total')
+
+            model_cols = [c for c in pivot.columns if c != 'conversationId']
+            fig_sess = px.bar(
+                pivot.melt(id_vars='conversationId', value_vars=model_cols,
+                           var_name='modelId', value_name='count'),
+                x='count', y='conversationId', color='modelId',
+                orientation='h', barmode='stack',
+                title='Top 10 Sessions — Model Breakdown',
+                labels={'count': 'Messages', 'conversationId': 'Session', 'modelId': 'Model'},
+                color_discrete_sequence=chart_colors,
+            )
+            fig_sess.update_traces(marker_line_width=0)
+            fig_sess.update_layout(
+                yaxis={'categoryorder': 'total ascending'},
+                height=max(200, 10 * 40 + 80),
+                legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+            )
+            apply_chart_theme_fn(fig_sess)
+            st.plotly_chart(fig_sess, use_container_width=True)
+
+    # Summary metrics row
+    mc1, mc2, mc3 = st.columns(3)
+    with mc1:
+        st.metric("Distinct Models", df['modelId'].nunique())
+    with mc2:
+        top_model = model_counts.iloc[0]['modelId'] if not model_counts.empty else '—'
+        st.metric("Most Used Model", top_model)
+    with mc3:
+        auto_pct = (df['modelId'] == 'auto').sum() / max(len(df), 1) * 100
+        st.metric("Auto Mode %", f"{auto_pct:.1f}%")
+
+
 # ── Chat tab ────────────────────────────────────────────────────────
 
 def _render_chat_tab(df_chat, search_query, apply_chart_theme_fn,
@@ -583,6 +665,12 @@ def _render_chat_tab(df_chat, search_query, apply_chart_theme_fn,
 
     st.markdown("---")
 
+    # ── Model Usage Top Chart ──
+    st.subheader("🤖 Model Usage")
+    _render_model_top_chart(df, apply_chart_theme_fn, chart_colors, theme_colors)
+
+    st.markdown("---")
+
     # ── Session tree view ──
     st.subheader("🗂️ Conversations by Session")
     st.caption("Messages grouped by conversationId — expand to see the full dialogue")
@@ -625,7 +713,7 @@ def _render_chat_tab(df_chat, search_query, apply_chart_theme_fn,
 
         with st.expander(label, expanded=False):
             # Session metadata
-            meta_c1, meta_c2, meta_c3 = st.columns(3)
+            meta_c1, meta_c2, meta_c3, meta_c4 = st.columns(4)
             with meta_c1:
                 st.markdown(f"**Conversation ID:** `{cid}`")
             with meta_c2:
@@ -636,6 +724,11 @@ def _render_chat_tab(df_chat, search_query, apply_chart_theme_fn,
                     delta = last_ts - first_ts
                     duration = f"{delta.total_seconds()/60:.1f} min"
                 st.markdown(f"**Duration:** {duration or 'single message'}")
+            with meta_c4:
+                # Show distinct models used in this session
+                session_models = list({m.get('modelId', '') for m in messages_sorted if m.get('modelId', '')})
+                models_str = ', '.join(f'`{m}`' for m in session_models) if session_models else '—'
+                st.markdown(f"**Model(s):** {models_str}")
 
             st.markdown("---")
 
@@ -648,7 +741,9 @@ def _render_chat_tab(df_chat, search_query, apply_chart_theme_fn,
                     trigger_badge = ' ✋ `MANUAL`'
 
                 ts_label = msg['timestamp'].strftime('%H:%M:%S') if pd.notna(msg['timestamp']) else ''
-                st.markdown(f"<div style='font-size:0.75rem;opacity:0.5;'>{ts_label}{trigger_badge}</div>",
+                model_label = msg.get('modelId', '')
+                model_badge = f' 🧠 `{model_label}`' if model_label and model_label != 'unknown' else ''
+                st.markdown(f"<div style='font-size:0.75rem;opacity:0.5;'>{ts_label}{trigger_badge}{model_badge}</div>",
                             unsafe_allow_html=True)
 
                 # User prompt
