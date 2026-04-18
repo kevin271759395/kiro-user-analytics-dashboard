@@ -19,6 +19,6 @@ IDENTITY_STORE_ID = os.getenv('IDENTITY_STORE_ID', '')
 PROMPT_LOG_S3_URI = os.getenv('PROMPT_LOG_S3_URI', '')
 
 # Streamlit Configuration
-PAGE_TITLE = "Kiro Users Report"
+PAGE_TITLE = "Kiro Enterprise Report"
 PAGE_ICON = "⚡"
 LAYOUT = "wide"
