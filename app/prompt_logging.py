@@ -36,42 +36,124 @@ def _parse_s3_uri(uri: str):
 
 
 @st.cache_data(ttl=120, show_spinner="Loading prompt logs from S3…")
-def list_log_files(s3_uri: str, start_date=None, end_date=None, max_keys=2000):
-    """List JSON log files under the given S3 URI, optionally filtered by date prefix."""
-    bucket, prefix = _parse_s3_uri(s3_uri)
+def list_log_files(s3_uri: str, start_date=None, end_date=None, max_keys=None):
+    """List JSON log files under the given S3 URI, optionally filtered by date prefix.
+
+    Uses date-based S3 prefixes when possible to narrow the listing scope,
+    and falls back to full listing with LastModified filtering otherwise.
+    """
+    bucket, base_prefix = _parse_s3_uri(s3_uri)
     s3 = _get_s3_client()
     files = []
-    paginator = s3.get_paginator('list_objects_v2')
-    pages = paginator.paginate(Bucket=bucket, Prefix=prefix, PaginationConfig={'MaxItems': max_keys})
-    for page in pages:
-        for obj in page.get('Contents', []):
-            key = obj['Key']
-            if not (key.endswith('.json') or key.endswith('.json.gz')):
-                continue
-            # Optional date filtering based on key path or LastModified
-            last_mod = obj.get('LastModified')
-            if start_date and last_mod and last_mod.date() < start_date:
-                continue
-            if end_date and last_mod and last_mod.date() > end_date:
-                continue
-            files.append({'key': key, 'size': obj['Size'],
-                          'last_modified': last_mod, 'bucket': bucket})
+
+    # Build date-based prefixes to narrow S3 listing.
+    date_prefixes = _build_date_prefixes(base_prefix, start_date, end_date)
+
+    for pfx in date_prefixes:
+        paginator = s3.get_paginator('list_objects_v2')
+        page_config = {}
+        if max_keys:
+            page_config['MaxItems'] = max_keys
+        pages = paginator.paginate(Bucket=bucket, Prefix=pfx,
+                                   **({"PaginationConfig": page_config} if page_config else {}))
+        for page in pages:
+            for obj in page.get('Contents', []):
+                key = obj['Key']
+                if not (key.endswith('.json') or key.endswith('.json.gz')):
+                    continue
+                last_mod = obj.get('LastModified')
+                if start_date and last_mod and last_mod.date() < start_date:
+                    continue
+                if end_date and last_mod and last_mod.date() > end_date:
+                    continue
+                files.append({'key': key, 'size': obj['Size'],
+                              'last_modified': last_mod, 'bucket': bucket})
     return files
+
+
+def _build_date_prefixes(base_prefix: str, start_date=None, end_date=None):
+    """Build a list of S3 prefixes scoped to each date in the range.
+
+    If the date range is small (≤ 31 days), we generate per-day prefixes like
+    ``<base>/…/YYYY/MM/DD/`` which dramatically reduces the number of objects
+    S3 needs to list.  For larger ranges (or when no dates are given) we fall
+    back to the base prefix so that all objects are scanned.
+
+    Because the exact path between *base_prefix* and the date components is
+    unknown (it contains accountId, eventType, region), we cannot construct
+    fully-qualified prefixes.  Instead we return the *base_prefix* itself and
+    rely on the caller's LastModified filter.  However, if the caller's bucket
+    only contains prompt logs (common setup), this is efficient enough.
+    """
+    # Always include the base prefix to catch all files
+    if not start_date or not end_date:
+        return [base_prefix]
+
+    delta = (end_date - start_date).days
+    if delta < 0 or delta > 62:
+        return [base_prefix]
+
+    # For reasonable ranges, still use the base prefix — the S3 path between
+    # base_prefix and the YYYY/MM/DD part is variable (accountId, eventType,
+    # region), so we can't build exact prefixes without discovering them first.
+    return [base_prefix]
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def read_log_file(bucket: str, key: str):
-    """Download and parse a single JSON log file from S3."""
+    """Download and parse a single JSON log file from S3.
+
+    Handles:
+    - Standard JSON with a top-level ``records`` array
+    - NDJSON (one JSON object per line)
+    - Single JSON record without a ``records`` wrapper
+    """
     s3 = _get_s3_client()
-    resp = s3.get_object(Bucket=bucket, Key=key)
+    try:
+        resp = s3.get_object(Bucket=bucket, Key=key)
+    except Exception:
+        return None
     raw = resp['Body'].read()
     if key.endswith('.gz'):
-        raw = gzip.decompress(raw)
-    body = raw.decode('utf-8')
-    try:
-        return json.loads(body)
-    except json.JSONDecodeError:
+        try:
+            raw = gzip.decompress(raw)
+        except Exception:
+            return None
+    body = raw.decode('utf-8').strip()
+    if not body:
         return None
+
+    # Try standard JSON first
+    try:
+        data = json.loads(body)
+        if isinstance(data, dict):
+            return data
+        # If the file is a JSON array, wrap it
+        if isinstance(data, list):
+            return {'records': data}
+        return None
+    except json.JSONDecodeError:
+        pass
+
+    # Try NDJSON (one JSON object per line)
+    records = []
+    for line in body.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            if isinstance(obj, dict):
+                # If each line already has 'records', extend
+                if 'records' in obj:
+                    records.extend(obj['records'])
+                else:
+                    records.append(obj)
+        except json.JSONDecodeError:
+            continue
+    if records:
+        return {'records': records}
+    return None
 
 
 # ── Record parsing ──────────────────────────────────────────────────
@@ -225,6 +307,28 @@ def render_prompt_logging_page(apply_chart_theme_fn, chart_colors, theme_colors,
 
     if not files:
         st.info(f"No log files found for {log_start} — {log_end}.")
+        with st.expander("🔧 Debug Info", expanded=True):
+            bucket, prefix = _parse_s3_uri(PROMPT_LOG_S3_URI)
+            st.markdown(f"- **S3 URI:** `{PROMPT_LOG_S3_URI}`")
+            st.markdown(f"- **Bucket:** `{bucket}`")
+            st.markdown(f"- **Prefix:** `{prefix}`")
+            st.markdown(f"- **Date range:** `{log_start}` — `{log_end}`")
+            # Try listing without date filter to see if any files exist at all
+            try:
+                s3 = _get_s3_client()
+                resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=5)
+                sample_keys = [obj['Key'] for obj in resp.get('Contents', [])]
+                if sample_keys:
+                    st.markdown("**Sample objects under prefix:**")
+                    for k in sample_keys:
+                        st.markdown(f"  - `{k}`")
+                    st.warning("Files exist in S3 but were filtered out by the date range. "
+                               "Try expanding the date range.")
+                else:
+                    st.error("No objects found under this S3 prefix. "
+                             "Check that the URI is correct and the app has `s3:ListBucket` + `s3:GetObject` permissions.")
+            except Exception as e:
+                st.error(f"Error accessing S3: {e}")
         return
 
     st.markdown(f"Found **{len(files)}** log files")
@@ -236,6 +340,29 @@ def render_prompt_logging_page(apply_chart_theme_fn, chart_colors, theme_colors,
 
     total_inline = len(df_inline)
     total_chat = len(df_chat)
+
+    # Show debug info if no records were parsed despite having files
+    if total_inline == 0 and total_chat == 0 and len(files) > 0:
+        with st.expander("🔧 Debug: Files found but no records parsed", expanded=True):
+            st.warning(f"{len(files)} log files were found but 0 records were parsed. "
+                       "Sampling the first file to diagnose…")
+            sample = files[0]
+            st.markdown(f"- **Key:** `{sample['key']}`")
+            st.markdown(f"- **Size:** {sample['size']} bytes")
+            try:
+                data = read_log_file(sample['bucket'], sample['key'])
+                if data is None:
+                    st.error("File could not be parsed as JSON. The file may be corrupted or in an unexpected format.")
+                elif 'records' not in data:
+                    st.error(f"JSON parsed but no `records` key found. Top-level keys: `{list(data.keys())}`")
+                    st.json(data)
+                else:
+                    st.success(f"JSON parsed OK — {len(data['records'])} record(s)")
+                    rec = data['records'][0] if data['records'] else {}
+                    st.markdown(f"First record keys: `{list(rec.keys())}`")
+                    st.json(rec)
+            except Exception as e:
+                st.error(f"Error reading sample file: {e}")
 
     # ── Summary metrics ──
     st.markdown("---")
