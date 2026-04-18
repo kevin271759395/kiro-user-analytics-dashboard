@@ -13,7 +13,7 @@
 ## 前置条件
 
 - 在 AWS 控制台中启用 Kiro 用户报告数据导出（见下文）
-- [Terraform](https://www.terraform.io/downloads) >= 1.0
+- [Terraform](https://developer.hashicorp.com/terraform/tutorials/aws-get-started/install-cli) >= 1.0
 - [AWS CLI](https://aws.amazon.com/cli/) 已配置相应凭证
 - Python 3.8+
 

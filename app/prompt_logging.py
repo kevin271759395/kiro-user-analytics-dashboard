@@ -7,6 +7,7 @@ Log format reference:
   https://kiro.dev/docs/enterprise/monitor-and-track/prompt-logging/
 """
 
+import gzip
 import json
 import re
 import streamlit as st
@@ -45,7 +46,7 @@ def list_log_files(s3_uri: str, start_date=None, end_date=None, max_keys=2000):
     for page in pages:
         for obj in page.get('Contents', []):
             key = obj['Key']
-            if not key.endswith('.json'):
+            if not (key.endswith('.json') or key.endswith('.json.gz')):
                 continue
             # Optional date filtering based on key path or LastModified
             last_mod = obj.get('LastModified')
@@ -63,7 +64,10 @@ def read_log_file(bucket: str, key: str):
     """Download and parse a single JSON log file from S3."""
     s3 = _get_s3_client()
     resp = s3.get_object(Bucket=bucket, Key=key)
-    body = resp['Body'].read().decode('utf-8')
+    raw = resp['Body'].read()
+    if key.endswith('.gz'):
+        raw = gzip.decompress(raw)
+    body = raw.decode('utf-8')
     try:
         return json.loads(body)
     except json.JSONDecodeError:
