@@ -509,9 +509,10 @@ def render_prompt_logging_page(apply_chart_theme_fn, chart_colors, theme_colors,
     display_name_map = _build_display_name_map(list(all_user_ids), get_username_fn)
 
     # ── Tab navigation ──
-    tab_chat, tab_inline, tab_ai_coding, tab_timeline = st.tabs([
+    tab_chat, tab_inline, tab_ai_coding, tab_timeline, tab_raw = st.tabs([
         "💬 Chat Conversations", "⚡ Inline Suggestions",
-        "🤖 AI Coding Acceptance", "📊 Activity Timeline"
+        "🤖 AI Coding Acceptance", "📊 Activity Timeline",
+        "📋 Chat Conversations RAW Data"
     ])
 
     # ══════════════════════════════════════════════════════════════
@@ -541,6 +542,12 @@ def render_prompt_logging_page(apply_chart_theme_fn, chart_colors, theme_colors,
     with tab_timeline:
         _render_timeline_tab(df_inline, df_chat, apply_chart_theme_fn,
                              chart_colors, theme_colors, display_name_map)
+
+    # ══════════════════════════════════════════════════════════════
+    # TAB 5: Chat Conversations RAW Data
+    # ══════════════════════════════════════════════════════════════
+    with tab_raw:
+        _render_raw_data_tab(df_chat, theme_colors, display_name_map)
 
 
 
@@ -1311,3 +1318,230 @@ def _render_ai_coding_tab(df_inline, df_chat, apply_chart_theme_fn,
 
         **对话会话数**：按 `conversationId` 去重计数。若日志中 `conversationId` 缺失，系统会按时间间隔（30 分钟）自动拆分会话。
         """)
+
+
+# ── Raw Data tab ────────────────────────────────────────────────────
+
+def _guess_language_from_filename(filename):
+    """Extract programming language label from a filename for filtering."""
+    ext_map = {
+        '.py': 'Python', '.js': 'JavaScript', '.ts': 'TypeScript',
+        '.tsx': 'TypeScript', '.jsx': 'JavaScript', '.java': 'Java',
+        '.go': 'Go', '.rs': 'Rust', '.rb': 'Ruby', '.cs': 'C#',
+        '.cpp': 'C++', '.c': 'C', '.html': 'HTML', '.css': 'CSS',
+        '.json': 'JSON', '.yaml': 'YAML', '.yml': 'YAML',
+        '.sh': 'Shell', '.sql': 'SQL', '.tf': 'HCL',
+        '.kt': 'Kotlin', '.swift': 'Swift', '.r': 'R',
+        '.scala': 'Scala', '.php': 'PHP', '.dart': 'Dart',
+        '.md': 'Markdown', '.xml': 'XML',
+    }
+    if not filename:
+        return ''
+    for ext, lang in ext_map.items():
+        if str(filename).endswith(ext):
+            return lang
+    return ''
+
+
+def _render_raw_data_tab(df_chat, theme_colors, display_name_map):
+    """Render raw chat log data grouped by session with filters."""
+
+    st.markdown("#### 📋 Chat Conversations RAW Data")
+    st.caption("按 Session 展示原始日志数据，支持按 User、编程语言、RequestId、ModelId 过滤")
+
+    if df_chat.empty:
+        st.info("No chat log records found in the selected date range.")
+        return
+
+    df = df_chat.copy()
+
+    # Derive programming language from prompt content file references
+    # Look for file extensions in the prompt text
+    def _detect_languages(row):
+        langs = set()
+        for field in ['prompt', 'assistantResponse']:
+            text = str(row.get(field, ''))
+            # Match file extensions in the text
+            exts = re.findall(r'\b\w+(\.\w{1,5})\b', text)
+            for ext in exts:
+                lang = _guess_language_from_filename('file' + ext)
+                if lang:
+                    langs.add(lang)
+        return ', '.join(sorted(langs)) if langs else ''
+
+    df['detectedLanguages'] = df.apply(_detect_languages, axis=1)
+
+    # ── Filters ──
+    fc1, fc2, fc3, fc4 = st.columns(4)
+
+    # User filter
+    raw_user_ids = sorted(df['userId'].dropna().unique().tolist())
+    user_display_options = {uid: display_name_map.get(uid, uid) for uid in raw_user_ids}
+    user_labels = ['All'] + [user_display_options[uid] for uid in raw_user_ids]
+    display_to_uid = {v: k for k, v in user_display_options.items()}
+
+    with fc1:
+        sel_user_label = st.selectbox("User", user_labels, key='raw_user_filter')
+
+    # Language filter
+    all_langs = set()
+    for langs_str in df['detectedLanguages']:
+        if langs_str:
+            for l in langs_str.split(', '):
+                all_langs.add(l)
+    lang_options = ['All'] + sorted(all_langs)
+
+    with fc2:
+        sel_lang = st.selectbox("编程语言", lang_options, key='raw_lang_filter')
+
+    # RequestId filter
+    with fc3:
+        sel_request_id = st.text_input("RequestId", key='raw_request_id_filter',
+                                       placeholder="输入 requestId 过滤…")
+
+    # ModelId filter
+    model_ids = sorted(df['modelId'].dropna().replace('', pd.NA).dropna().unique().tolist())
+    model_options = ['All'] + model_ids
+
+    with fc4:
+        sel_model = st.selectbox("ModelId", model_options, key='raw_model_filter')
+
+    # Apply filters
+    if sel_user_label != 'All':
+        sel_user_id = display_to_uid.get(sel_user_label, sel_user_label)
+        df = df[df['userId'] == sel_user_id]
+    if sel_lang != 'All':
+        df = df[df['detectedLanguages'].str.contains(sel_lang, na=False)]
+    if sel_request_id:
+        df = df[df['requestId'].str.contains(sel_request_id, case=False, na=False)]
+    if sel_model != 'All':
+        df = df[df['modelId'] == sel_model]
+
+    if df.empty:
+        st.warning("当前过滤条件下没有匹配的记录。")
+        return
+
+    # ── Stats ──
+    st1, st2, st3 = st.columns(3)
+    with st1:
+        st.metric("匹配记录数", len(df))
+    with st2:
+        st.metric("Session 数", df['conversationId'].nunique())
+    with st3:
+        st.metric("涉及用户数", df['userId'].nunique())
+
+    st.markdown("---")
+
+    # ── Group by session ──
+    sessions = {}
+    for _, row in df.iterrows():
+        cid = row['conversationId'] or 'unknown'
+        if cid not in sessions:
+            sessions[cid] = []
+        sessions[cid].append(row)
+
+    sorted_sessions = sorted(
+        sessions.items(),
+        key=lambda x: x[1][0]['timestamp'] if pd.notna(x[1][0]['timestamp']) else pd.Timestamp.min,
+        reverse=True
+    )
+
+    # Pagination
+    PAGE_SIZE = 10
+    total_sessions = len(sorted_sessions)
+    total_pages = max(1, (total_sessions + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = st.number_input("Page", min_value=1, max_value=total_pages, value=1,
+                           key='raw_page') - 1
+    start_idx = page * PAGE_SIZE
+    page_sessions = sorted_sessions[start_idx:start_idx + PAGE_SIZE]
+
+    st.caption(f"Showing sessions {start_idx+1}–{min(start_idx+PAGE_SIZE, total_sessions)} of {total_sessions}")
+
+    for cid, messages in page_sessions:
+        messages_sorted = sorted(
+            messages,
+            key=lambda m: m['timestamp'] if pd.notna(m['timestamp']) else pd.Timestamp.min
+        )
+        first_ts = messages_sorted[0]['timestamp']
+        user_id = messages_sorted[0]['userId']
+        display_user = display_name_map.get(user_id, user_id)
+        ts_str = first_ts.strftime('%Y-%m-%d %H:%M') if pd.notna(first_ts) else '?'
+
+        label = f"📋 {ts_str} — {display_user} — {len(messages_sorted)} msgs — Session: {cid}"
+
+        with st.expander(label, expanded=False):
+            # Session-level raw JSON export
+            session_records = []
+            for msg in messages_sorted:
+                record = {}
+                for col in msg.index:
+                    val = msg[col]
+                    if pd.isna(val):
+                        record[col] = None
+                    elif hasattr(val, 'isoformat'):
+                        record[col] = val.isoformat()
+                    elif isinstance(val, (list, dict)):
+                        record[col] = val
+                    else:
+                        record[col] = str(val)
+                session_records.append(record)
+
+            # Download button for this session
+            session_json = json.dumps(session_records, indent=2, ensure_ascii=False)
+            st.download_button(
+                label="⬇️ 下载此 Session JSON",
+                data=session_json,
+                file_name=f"session_{cid}.json",
+                mime="application/json",
+                key=f"dl_{cid}"
+            )
+
+            # Render each record as raw data
+            for i, msg in enumerate(messages_sorted):
+                ts_label = msg['timestamp'].strftime('%Y-%m-%d %H:%M:%S') if pd.notna(msg['timestamp']) else '?'
+                st.markdown(f"**Record {i+1}** — `{ts_label}`")
+
+                # Key fields table
+                raw_fields = {
+                    'userId': msg.get('userId', ''),
+                    'requestId': msg.get('requestId', ''),
+                    'modelId': msg.get('modelId', ''),
+                    'conversationId': msg.get('conversationId', ''),
+                    'utteranceId': msg.get('utteranceId', ''),
+                    'chatTriggerType': msg.get('chatTriggerType', ''),
+                    'timestamp': ts_label,
+                    'source_file': msg.get('source_file', ''),
+                    'detectedLanguages': msg.get('detectedLanguages', ''),
+                }
+                df_fields = pd.DataFrame(
+                    list(raw_fields.items()), columns=['Field', 'Value']
+                )
+                st.dataframe(df_fields, use_container_width=True, hide_index=True)
+
+                # Prompt & Response raw content
+                col_p, col_r = st.columns(2)
+                with col_p:
+                    st.markdown("**Prompt (raw):**")
+                    prompt_text = msg.get('prompt', '')
+                    st.code(prompt_text if prompt_text else '(empty)', language='text')
+                with col_r:
+                    st.markdown("**Assistant Response (raw):**")
+                    resp_text = msg.get('assistantResponse', '')
+                    st.code(resp_text if resp_text else '(empty)', language='markdown')
+
+                # Additional fields as JSON
+                extra = {}
+                if msg.get('followupPrompts'):
+                    extra['followupPrompts'] = msg['followupPrompts']
+                if msg.get('codeReferenceEvents') and len(msg['codeReferenceEvents']) > 0:
+                    extra['codeReferenceEvents'] = msg['codeReferenceEvents']
+                if msg.get('supplementaryWebLinks') and len(msg['supplementaryWebLinks']) > 0:
+                    extra['supplementaryWebLinks'] = msg['supplementaryWebLinks']
+                if msg.get('customizationArn'):
+                    extra['customizationArn'] = msg['customizationArn']
+
+                if extra:
+                    with st.popover("📎 其他字段"):
+                        st.json(extra)
+
+                st.markdown("<hr style='margin:8px 0;opacity:0.15;'>", unsafe_allow_html=True)
