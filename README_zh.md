@@ -210,6 +210,11 @@ Terraform 需要创建和管理以下资源，因此执行 `terraform apply` 的
         "athena:ListTagsForResource"
       ],
       "Resource": "arn:aws:athena:*:154486397967:workgroup/kiro-user-report-dashboard-*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["identitystore:DescribeUser", "identitystore:ListUsers"],
+      "Resource": "*"
     }
   ]
 }
