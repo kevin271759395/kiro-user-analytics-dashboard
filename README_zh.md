@@ -28,7 +28,87 @@
 详细说明请参阅 [Kiro 用户活动文档](https://kiro.dev/docs/enterprise/monitor-and-track/user-activity/)。
 
 ## 快速开始
+### deploy和terraform运行的权限和程序运行的权限说明
+下面是 `deploy.sh` 和 Terraform 部署所需的 AWS 权限梳理：
 
+---
+
+#### 一、执行 Terraform 的 IAM 权限（部署者/CI 角色）
+
+Terraform 需要创建和管理以下资源，因此执行 `terraform apply` 的身份需要：
+
+**S3**
+- `s3:CreateBucket`, `s3:DeleteBucket`, `s3:PutBucketVersioning`, `s3:PutBucketLifecycleConfiguration`
+- `s3:PutEncryptionConfiguration`, `s3:PutBucketPublicAccessBlock`
+- `s3:GetBucketPolicy`, `s3:GetBucketVersioning`, `s3:ListBucket`, `s3:GetObject`, `s3:PutObject`
+- 作用范围：`{project_name}-athena-results` 桶
+
+**Glue**
+- `glue:CreateDatabase`, `glue:DeleteDatabase`, `glue:GetDatabase`
+- `glue:CreateCrawler`, `glue:DeleteCrawler`, `glue:GetCrawler`, `glue:UpdateCrawler`
+- `glue:StartCrawler`（deploy.sh 中手动触发 crawler）
+
+**Athena**
+- `athena:CreateWorkGroup`, `athena:DeleteWorkGroup`, `athena:GetWorkGroup`, `athena:UpdateWorkGroup`
+
+**IAM**
+- `iam:CreateRole`, `iam:DeleteRole`, `iam:GetRole`, `iam:PassRole`
+- `iam:CreatePolicy`, `iam:DeletePolicy`, `iam:GetPolicy`, `iam:GetPolicyVersion`, `iam:ListPolicyVersions`
+- `iam:AttachRolePolicy`, `iam:DetachRolePolicy`
+- `iam:PutRolePolicy`, `iam:DeleteRolePolicy`, `iam:GetRolePolicy`
+- `iam:CreateInstanceProfile`, `iam:DeleteInstanceProfile`, `iam:AddRoleToInstanceProfile`, `iam:RemoveRoleFromInstanceProfile`, `iam:GetInstanceProfile`
+- `iam:CreateUser`, `iam:DeleteUser`, `iam:GetUser`
+- `iam:AttachUserPolicy`, `iam:DetachUserPolicy`
+- 涉及的资源：`glue-crawler-role`, `app-role`, `app-user`, `app-instance-profile` 以及多个 policy
+
+**Terraform State（如果用远程 backend）**
+- 对应 S3 + DynamoDB 的读写权限（本项目未配置远程 backend，可忽略）
+
+---
+
+#### 二、deploy.sh 额外需要的权限
+
+除了上面 Terraform 的权限外，deploy.sh 还直接调用了 AWS CLI：
+
+- `glue:StartCrawler` — 启动 Glue Crawler
+- `glue:GetCrawler` — 轮询 Crawler 状态直到完成
+
+---
+
+#### 三、应用运行时权限（app 角色/用户）
+
+Terraform 已经通过 `athena_access_policy` 和 `prompt_log_s3_policy` 定义了应用所需的权限，梳理如下：
+
+**Athena 查询**
+- `athena:StartQueryExecution`, `athena:GetQueryExecution`, `athena:GetQueryResults`, `athena:StopQueryExecution`, `athena:GetWorkGroup`
+
+**Glue Catalog（读取表结构）**
+- `glue:GetDatabase`, `glue:GetTable`, `glue:GetTables`, `glue:GetPartitions`
+
+**S3 数据源（读取 Kiro 日志数据）**
+- `s3:GetObject`, `s3:ListBucket` — 对 `{s3_bucket_name}/AWSLogs/{account_id}/KiroLogs/...`
+
+**S3 Athena 结果桶（读写）**
+- `s3:GetObject`, `s3:PutObject`, `s3:ListBucket` — 对 `{project_name}-athena-results`
+
+**S3 Prompt Log（可选，仅当配置了 `prompt_log_s3_uri`）**
+- `s3:GetObject`, `s3:ListBucket` — 对 prompt log 桶和前缀
+
+**Identity Store（用户名解析）**
+- `identitystore:DescribeUser` — 代码中调用了 `describe_user`，但 Terraform 中未为此创建 policy，需要手动补充或确保运行身份已有此权限
+
+---
+
+#### 四、总结
+
+| 角色 | 关键权限范围 |
+|---|---|
+| 部署者（Terraform + deploy.sh） | S3、Glue、Athena、IAM 的完整 CRUD |
+| 应用运行时 | Athena 查询、Glue 读取、S3 数据读取、S3 结果读写、IdentityStore 读取、（可选）Prompt Log S3 读取 |
+
+值得注意的是，`identitystore:DescribeUser` 权限在 Terraform 中没有被声明到任何 policy 里，但 `app.py` 运行时会调用它来解析用户名。如果应用运行时遇到权限不足的问题，这是一个需要补充的点。
+
+### 快速部署
 ```bash
 git clone https://github.com/aws-samples/sample-kiro-user-analytics-dashboard.git
 cd sample-kiro-user-analytics-dashboard
