@@ -37,66 +37,77 @@ def _parse_s3_uri(uri: str):
 
 @st.cache_data(ttl=120, show_spinner="Loading prompt logs from S3…")
 def list_log_files(s3_uri: str, start_date=None, end_date=None, max_keys=None):
-    """List JSON log files under the given S3 URI, optionally filtered by date prefix.
+    """List JSON log files under the given S3 URI, optionally filtered by date.
 
-    Uses date-based S3 prefixes when possible to narrow the listing scope,
-    and falls back to full listing with LastModified filtering otherwise.
+    Filters by the embedded timestamp in the filename when available
+    (e.g. ``…_GenerateAssistantResponse_202604171000_xxx.json.gz``),
+    falling back to S3 LastModified otherwise.
     """
     bucket, base_prefix = _parse_s3_uri(s3_uri)
     s3 = _get_s3_client()
     files = []
 
-    # Build date-based prefixes to narrow S3 listing.
-    date_prefixes = _build_date_prefixes(base_prefix, start_date, end_date)
+    paginator = s3.get_paginator('list_objects_v2')
+    page_config = {}
+    if max_keys:
+        page_config['MaxItems'] = max_keys
+    pages = paginator.paginate(Bucket=bucket, Prefix=base_prefix,
+                               **({"PaginationConfig": page_config} if page_config else {}))
+    for page in pages:
+        for obj in page.get('Contents', []):
+            key = obj['Key']
+            if not (key.endswith('.json') or key.endswith('.json.gz')):
+                continue
 
-    for pfx in date_prefixes:
-        paginator = s3.get_paginator('list_objects_v2')
-        page_config = {}
-        if max_keys:
-            page_config['MaxItems'] = max_keys
-        pages = paginator.paginate(Bucket=bucket, Prefix=pfx,
-                                   **({"PaginationConfig": page_config} if page_config else {}))
-        for page in pages:
-            for obj in page.get('Contents', []):
-                key = obj['Key']
-                if not (key.endswith('.json') or key.endswith('.json.gz')):
+            # Try to extract date from filename timestamp (YYYYMMDDHHmm)
+            file_date = _extract_file_date(key)
+
+            if file_date:
+                # Use the precise filename-embedded date for filtering
+                if start_date and file_date < start_date:
                     continue
+                if end_date and file_date > end_date:
+                    continue
+            else:
+                # Fallback to S3 LastModified
                 last_mod = obj.get('LastModified')
                 if start_date and last_mod and last_mod.date() < start_date:
                     continue
                 if end_date and last_mod and last_mod.date() > end_date:
                     continue
-                files.append({'key': key, 'size': obj['Size'],
-                              'last_modified': last_mod, 'bucket': bucket})
+
+            files.append({
+                'key': key,
+                'size': obj['Size'],
+                'last_modified': obj.get('LastModified'),
+                'bucket': bucket,
+                'file_date': file_date,  # extracted date from filename
+                'file_ts': _extract_file_timestamp(key),  # full datetime
+            })
     return files
 
 
-def _build_date_prefixes(base_prefix: str, start_date=None, end_date=None):
-    """Build a list of S3 prefixes scoped to each date in the range.
+# Regex to match the embedded timestamp in log filenames:
+# e.g. 154486397967_GenerateAssistantResponse_202604171000_PxOewWyBjDuZfv2W.json.gz
+_FILENAME_TS_RE = re.compile(r'_(\d{12})_[A-Za-z0-9]+\.json(?:\.gz)?$')
 
-    If the date range is small (≤ 31 days), we generate per-day prefixes like
-    ``<base>/…/YYYY/MM/DD/`` which dramatically reduces the number of objects
-    S3 needs to list.  For larger ranges (or when no dates are given) we fall
-    back to the base prefix so that all objects are scanned.
 
-    Because the exact path between *base_prefix* and the date components is
-    unknown (it contains accountId, eventType, region), we cannot construct
-    fully-qualified prefixes.  Instead we return the *base_prefix* itself and
-    rely on the caller's LastModified filter.  However, if the caller's bucket
-    only contains prompt logs (common setup), this is efficient enough.
-    """
-    # Always include the base prefix to catch all files
-    if not start_date or not end_date:
-        return [base_prefix]
+def _extract_file_timestamp(key: str):
+    """Extract a datetime from the filename timestamp (YYYYMMDDHHmm), or None."""
+    filename = key.rsplit('/', 1)[-1]
+    m = _FILENAME_TS_RE.search(filename)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), '%Y%m%d%H%M')
+    except ValueError:
+        return None
 
-    delta = (end_date - start_date).days
-    if delta < 0 or delta > 62:
-        return [base_prefix]
 
-    # For reasonable ranges, still use the base prefix — the S3 path between
-    # base_prefix and the YYYY/MM/DD part is variable (accountId, eventType,
-    # region), so we can't build exact prefixes without discovering them first.
-    return [base_prefix]
+def _extract_file_date(key: str):
+    """Extract just the date portion from the filename timestamp, or None."""
+    ts = _extract_file_timestamp(key)
+    return ts.date() if ts else None
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -171,6 +182,7 @@ def parse_log_records(files, progress_bar=None):
         if not data or 'records' not in data:
             continue
         source_file = f['key']
+        file_ts = f.get('file_ts')  # datetime from filename, e.g. 202604171000
         for rec in data['records']:
             # ── Inline suggestion ──
             if 'generateCompletionsEventRequest' in rec:
@@ -193,8 +205,19 @@ def parse_log_records(files, progress_bar=None):
                 req = rec['generateAssistantResponseEventRequest']
                 resp = rec.get('generateAssistantResponseEventResponse', {})
                 meta = resp.get('messageMetadata', {})
+                # Try multiple locations for conversationId:
+                # 1. response messageMetadata (original)
+                # 2. request-level conversationId
+                # 3. record-level conversationId
+                conv_id = (
+                    meta.get('conversationId')
+                    or req.get('conversationId')
+                    or rec.get('conversationId')
+                    or ''
+                )
                 chat_rows.append({
                     'source_file': source_file,
+                    'source_file_ts': file_ts,  # hour-level ts from filename
                     'type': 'chat',
                     'userId': req.get('userId', ''),
                     'timestamp': req.get('timeStamp', ''),
@@ -203,7 +226,7 @@ def parse_log_records(files, progress_bar=None):
                     'customizationArn': req.get('customizationArn'),
                     'assistantResponse': resp.get('assistantResponse', ''),
                     'followupPrompts': resp.get('followupPrompts', ''),
-                    'conversationId': meta.get('conversationId', ''),
+                    'conversationId': conv_id,
                     'utteranceId': meta.get('utteranceId', ''),
                     'codeReferenceEvents': resp.get('codeReferenceEvents', []),
                     'supplementaryWebLinks': resp.get('supplementaryWebLinksEvent', []),
@@ -218,6 +241,60 @@ def parse_log_records(files, progress_bar=None):
         if not df.empty and 'timestamp' in df.columns:
             df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce', utc=True)
             df.sort_values('timestamp', ascending=False, inplace=True)
+
+    # ── Session splitting fallback ──
+    # If all chat messages share a single conversationId (or all are empty),
+    # split them into separate sessions using:
+    #   - Different source log file (each file covers ~1 hour)
+    #   - Time gap > 30 min between consecutive messages
+    #   - Different user
+    if not df_chat.empty:
+        unique_ids = df_chat['conversationId'].replace('', pd.NA).dropna().unique()
+        needs_splitting = (len(unique_ids) <= 1)
+
+        if needs_splitting and len(df_chat) > 1:
+            df_chat = df_chat.sort_values('timestamp').reset_index(drop=True)
+            session_gap = pd.Timedelta(minutes=30)
+            session_ids = []
+            current_session = 0
+            prev_ts = None
+            prev_user = None
+            prev_source = None
+
+            for _, row in df_chat.iterrows():
+                ts = row['timestamp']
+                user = row['userId']
+                source = row.get('source_file', '')
+                new_session = False
+
+                if prev_ts is not None:
+                    # Different source file = different hourly log batch
+                    if source != prev_source:
+                        new_session = True
+                    # Time gap > 30 min
+                    elif pd.notna(ts) and pd.notna(prev_ts) and (ts - prev_ts) > session_gap:
+                        new_session = True
+                    # Different user
+                    elif user != prev_user:
+                        new_session = True
+
+                if new_session:
+                    current_session += 1
+
+                prev_ts = ts
+                prev_user = user
+                prev_source = source
+                session_ids.append(current_session)
+
+            # Build readable session IDs using the first timestamp of each session
+            df_chat['_session_num'] = session_ids
+            session_start_ts = df_chat.groupby('_session_num')['timestamp'].min()
+            df_chat['conversationId'] = df_chat['_session_num'].map(
+                lambda s: f"session-{session_start_ts[s].strftime('%Y%m%d-%H%M')}"
+                if pd.notna(session_start_ts[s]) else f"session-{s}"
+            )
+            df_chat.drop(columns=['_session_num'], inplace=True)
+            df_chat.sort_values('timestamp', ascending=False, inplace=True)
 
     return df_inline, df_chat
 
