@@ -271,6 +271,27 @@ resource "aws_iam_policy" "prompt_log_s3_policy" {
   })
 }
 
+# IAM Policy for Identity Store username lookup
+resource "aws_iam_policy" "identity_store_policy" {
+  count       = var.identity_store_id != "" ? 1 : 0
+  name        = "${var.project_name}-identity-store-read"
+  description = "Read-only access to IAM Identity Center Identity Store for username resolution"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "identitystore:DescribeUser",
+          "identitystore:ListUsers"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
 # IAM Role for application (recommended for production - use with ECS, EC2, or Lambda)
 # This role can be assumed by ECS tasks, EC2 instances, or Lambda functions
 resource "aws_iam_role" "app_role" {
@@ -307,6 +328,12 @@ resource "aws_iam_role_policy_attachment" "app_role_prompt_log_access" {
   policy_arn = aws_iam_policy.prompt_log_s3_policy[0].arn
 }
 
+resource "aws_iam_role_policy_attachment" "app_role_identity_store_access" {
+  count      = var.identity_store_id != "" ? 1 : 0
+  role       = aws_iam_role.app_role.name
+  policy_arn = aws_iam_policy.identity_store_policy[0].arn
+}
+
 # IAM Instance Profile for EC2 (if running on EC2)
 resource "aws_iam_instance_profile" "app_instance_profile" {
   name = "${var.project_name}-app-instance-profile"
@@ -332,4 +359,10 @@ resource "aws_iam_user_policy_attachment" "app_user_prompt_log_access" {
   count      = var.prompt_log_s3_uri != "" ? 1 : 0
   user       = aws_iam_user.app_user.name
   policy_arn = aws_iam_policy.prompt_log_s3_policy[0].arn
+}
+
+resource "aws_iam_user_policy_attachment" "app_user_identity_store_access" {
+  count      = var.identity_store_id != "" ? 1 : 0
+  user       = aws_iam_user.app_user.name
+  policy_arn = aws_iam_policy.identity_store_policy[0].arn
 }
