@@ -19,6 +19,10 @@ locals {
   s3_data_path = "${var.s3_bucket_name}/AWSLogs/${var.aws_account_id}/KiroLogs/user_report/${var.aws_region}"
   # Extract the actual bucket name (before the first slash) for ARN-based policies
   s3_bucket_only = split("/", var.s3_bucket_name)[0]
+  # Prompt log S3 — parse bucket and prefix from the s3:// URI
+  _prompt_log_trimmed  = var.prompt_log_s3_uri != "" ? trimprefix(var.prompt_log_s3_uri, "s3://") : ""
+  prompt_log_bucket    = var.prompt_log_s3_uri != "" ? split("/", local._prompt_log_trimmed)[0] : ""
+  prompt_log_prefix    = var.prompt_log_s3_uri != "" ? trimsuffix(trimprefix(local._prompt_log_trimmed, "${local.prompt_log_bucket}/"), "/") : ""
 }
 
 # S3 Bucket for Athena query results
@@ -243,6 +247,30 @@ resource "aws_iam_policy" "athena_access_policy" {
   #tags = var.tags
 }
 
+# IAM Policy for Prompt Log S3 read access (conditional — only when prompt_log_s3_uri is set)
+resource "aws_iam_policy" "prompt_log_s3_policy" {
+  count       = var.prompt_log_s3_uri != "" ? 1 : 0
+  name        = "${var.project_name}-prompt-log-s3-read"
+  description = "Read-only access to Kiro prompt log S3 bucket"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:ListBucket"
+        ]
+        Resource = [
+          "arn:aws:s3:::${local.prompt_log_bucket}",
+          "arn:aws:s3:::${local.prompt_log_bucket}/${local.prompt_log_prefix}/*"
+        ]
+      }
+    ]
+  })
+}
+
 # IAM Role for application (recommended for production - use with ECS, EC2, or Lambda)
 # This role can be assumed by ECS tasks, EC2 instances, or Lambda functions
 resource "aws_iam_role" "app_role" {
@@ -273,6 +301,12 @@ resource "aws_iam_role_policy_attachment" "app_role_athena_access" {
   policy_arn = aws_iam_policy.athena_access_policy.arn
 }
 
+resource "aws_iam_role_policy_attachment" "app_role_prompt_log_access" {
+  count      = var.prompt_log_s3_uri != "" ? 1 : 0
+  role       = aws_iam_role.app_role.name
+  policy_arn = aws_iam_policy.prompt_log_s3_policy[0].arn
+}
+
 # IAM Instance Profile for EC2 (if running on EC2)
 resource "aws_iam_instance_profile" "app_instance_profile" {
   name = "${var.project_name}-app-instance-profile"
@@ -292,4 +326,10 @@ resource "aws_iam_user" "app_user" {
 resource "aws_iam_user_policy_attachment" "app_user_athena_access" {
   user       = aws_iam_user.app_user.name
   policy_arn = aws_iam_policy.athena_access_policy.arn
+}
+
+resource "aws_iam_user_policy_attachment" "app_user_prompt_log_access" {
+  count      = var.prompt_log_s3_uri != "" ? 1 : 0
+  user       = aws_iam_user.app_user.name
+  policy_arn = aws_iam_policy.prompt_log_s3_policy[0].arn
 }

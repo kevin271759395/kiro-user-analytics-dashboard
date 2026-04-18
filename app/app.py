@@ -5,9 +5,10 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import boto3
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 from config import *
+from prompt_logging import render_prompt_logging_page
 
 # Hide deploy button
 os.environ['STREAMLIT_SERVER_ENABLE_STATIC_SERVING'] = 'false'
@@ -235,17 +236,60 @@ def safe_int(val, default=0):
     except (ValueError, TypeError):
         return default
 
+
+# --- Date / language filter helpers ---
+
+def build_where_clause(table_name, start_date=None, end_date=None, language=None):
+    """Build a WHERE clause for date range and programming language filters."""
+    conditions = []
+    if start_date:
+        conditions.append(f"date >= '{start_date}'")
+    if end_date:
+        conditions.append(f"date <= '{end_date}'")
+    if language and language != 'All':
+        conditions.append(f"programming_language = '{language}'")
+    return (" WHERE " + " AND ".join(conditions)) if conditions else ""
+
+
+def compute_wau_mau(df_daily):
+    """Given a daily DataFrame with 'date' and 'active_users' (or raw user-level data),
+    compute weekly and monthly active user counts using rolling windows."""
+    # df_daily is expected to have columns: date, userid (one row per user per day)
+    df = df_daily.copy()
+    df['date'] = pd.to_datetime(df['date'])
+
+    # Weekly: ISO week
+    df['week'] = df['date'].dt.isocalendar().year.astype(str) + '-W' + \
+                 df['date'].dt.isocalendar().week.astype(str).str.zfill(2)
+    wau = df.groupby('week')['userid'].nunique().reset_index()
+    wau.columns = ['week', 'active_users']
+
+    # Monthly
+    df['month'] = df['date'].dt.to_period('M').astype(str)
+    mau = df.groupby('month')['userid'].nunique().reset_index()
+    mau.columns = ['month', 'active_users']
+
+    # Daily
+    dau = df.groupby('date')['userid'].nunique().reset_index()
+    dau.columns = ['date', 'active_users']
+
+    return dau, wau, mau
+
+
 # --- Main app ---
 
 def main():
     # Header
-    header_col1, header_col2, header_col3 = st.columns([6, 1, 0.5])
+    header_col1, header_col2, header_col3, header_col4 = st.columns([5, 2, 1, 0.5])
     with header_col1:
         st.markdown('<p class="dashboard-title">⚡ Kiro Users Report</p>', unsafe_allow_html=True)
         st.markdown('<p class="dashboard-subtitle">Usage metrics across your organization</p>', unsafe_allow_html=True)
     with header_col2:
-        refresh = st.button("🔄 Refresh Data")
+        page = st.selectbox("📂 Navigate", ["📊 Usage Dashboard", "📝 Prompt Logging"],
+                            key='nav_page', label_visibility='collapsed')
     with header_col3:
+        refresh = st.button("🔄 Refresh Data")
+    with header_col4:
         theme_icon = "🌙" if st.session_state.theme == 'light' else "☀️"
         if st.button(theme_icon, help="Toggle theme"):
             st.session_state.theme = 'dark' if st.session_state.theme == 'light' else 'light'
@@ -255,9 +299,62 @@ def main():
     if refresh:
         st.cache_data.clear()
 
+    # ── Route to selected page ──
+    if page == "📝 Prompt Logging":
+        render_prompt_logging_page(
+            apply_chart_theme_fn=apply_chart_theme,
+            chart_colors=CHART_COLORS,
+            theme_colors=current_theme,
+            get_username_fn=get_username,
+        )
+        return
+
+    # ── Usage Dashboard (original content below) ──
     try:
         # Auto-discover table name from Glue database
         table_name = resolve_table_name()
+
+        # ── Global Filters (date range + programming language) ──
+        st.markdown("#### 🔍 Filters")
+        filter_col1, filter_col2, filter_col3, filter_col4 = st.columns([2, 2, 2, 2])
+
+        # Fetch available date range
+        df_date_range = fetch_data(f"SELECT MIN(date) as min_date, MAX(date) as max_date FROM {table_name}")
+        data_min_date = pd.to_datetime(df_date_range['min_date'].iloc[0]).date()
+        data_max_date = pd.to_datetime(df_date_range['max_date'].iloc[0]).date()
+
+        with filter_col1:
+            start_date = st.date_input("Start Date", value=data_min_date,
+                                       min_value=data_min_date, max_value=data_max_date)
+        with filter_col2:
+            end_date = st.date_input("End Date", value=data_max_date,
+                                     min_value=data_min_date, max_value=data_max_date)
+
+        # Fetch available programming languages (if column exists)
+        try:
+            df_langs = fetch_data(
+                f"SELECT DISTINCT programming_language FROM {table_name} "
+                f"WHERE programming_language IS NOT NULL AND programming_language != '' "
+                f"ORDER BY programming_language"
+            )
+            languages = ['All'] + df_langs['programming_language'].tolist()
+        except Exception:
+            languages = ['All']
+
+        with filter_col3:
+            selected_language = st.selectbox("Programming Language", languages,
+                                             help="Filter metrics by programming language")
+        with filter_col4:
+            st.markdown("")  # spacer
+            st.markdown("")
+            st.markdown(f"📅 Data range: **{data_min_date}** to **{data_max_date}**")
+
+        where_clause = build_where_clause(table_name, start_date, end_date,
+                                          selected_language if selected_language != 'All' else None)
+
+        st.markdown("---")
+
+
         with st.expander("ℹ️ Metric Definitions", expanded=False):
             st.markdown("""
             **Date**: Date of the report activity.
@@ -287,40 +384,366 @@ def main():
             📖 **Learn more about Kiro metrics**: [Kiro Documentation - Monitor and Track](https://kiro.dev/docs/enterprise/monitor-and-track/)
             """)
 
-        # ── Overall Metrics ──
+        # ══════════════════════════════════════════════════════════════
+        # SECTION 1: Subscription Overview (Official Dashboard Metrics)
+        # ══════════════════════════════════════════════════════════════
+        st.header("📋 Subscription Overview")
+        st.caption("Mirrors the official Kiro console dashboard — subscriptions by tier and status")
+
+        # Query subscription data: total / active / pending per tier
+        # Active = users who have at least one record (they used Kiro)
+        # We derive subscription status from activity data:
+        #   - A userid with total_messages > 0 in the period is "Active"
+        #   - A userid with total_messages = 0 (or only null) is "Pending"
+        query_subscriptions = f"""
+        SELECT
+            subscription_tier,
+            userid,
+            SUM(TRY_CAST(total_messages AS INTEGER)) as total_messages
+        FROM {table_name}
+        {where_clause}
+        GROUP BY subscription_tier, userid
+        """
+        df_subs = fetch_data(query_subscriptions)
+        df_subs['total_messages'] = df_subs['total_messages'].apply(safe_int)
+
+        # Derive status
+        df_subs['status'] = df_subs['total_messages'].apply(
+            lambda x: 'Active' if x > 0 else 'Pending'
+        )
+
+        # Aggregate per tier
+        tier_total = df_subs.groupby('subscription_tier')['userid'].nunique().reset_index()
+        tier_total.columns = ['subscription_tier', 'total']
+
+        tier_active = df_subs[df_subs['status'] == 'Active'].groupby('subscription_tier')['userid'].nunique().reset_index()
+        tier_active.columns = ['subscription_tier', 'active']
+
+        tier_pending = df_subs[df_subs['status'] == 'Pending'].groupby('subscription_tier')['userid'].nunique().reset_index()
+        tier_pending.columns = ['subscription_tier', 'pending']
+
+        tier_summary = tier_total.merge(tier_active, on='subscription_tier', how='left') \
+                                 .merge(tier_pending, on='subscription_tier', how='left')
+        tier_summary['active'] = tier_summary['active'].fillna(0).astype(int)
+        tier_summary['pending'] = tier_summary['pending'].fillna(0).astype(int)
+
+        # Overall totals
+        total_all = df_subs['userid'].nunique()
+        active_all = df_subs[df_subs['status'] == 'Active']['userid'].nunique()
+        pending_all = df_subs[df_subs['status'] == 'Pending']['userid'].nunique()
+
+        # --- Total Subscriptions per Tier ---
+        st.subheader("Total Subscriptions per Tier")
+        st.caption("Total subscriptions broken down by tier (Pro, Pro+, Power)")
+        tier_cols = st.columns(len(tier_summary) + 1)
+        with tier_cols[0]:
+            st.metric("All Tiers", total_all)
+        for i, row in tier_summary.iterrows():
+            with tier_cols[i + 1]:
+                st.metric(row['subscription_tier'], row['total'])
+
+        col_sub1, col_sub2 = st.columns(2)
+
+        # --- Active Subscriptions per Tier ---
+        with col_sub1:
+            st.subheader("Active Subscriptions per Tier")
+            st.caption("Users who have started using Kiro (you are being charged)")
+            active_cols = st.columns(len(tier_summary) + 1)
+            with active_cols[0]:
+                st.metric("All Active", active_all,
+                          delta=f"{active_all / max(total_all, 1) * 100:.0f}% of total")
+            for i, row in tier_summary.iterrows():
+                with active_cols[i + 1]:
+                    st.metric(f"{row['subscription_tier']}", row['active'])
+
+        # --- Pending Subscriptions per Tier ---
+        with col_sub2:
+            st.subheader("Pending Subscriptions per Tier")
+            st.caption("Users who have not yet started using Kiro (not being charged)")
+            pending_cols = st.columns(len(tier_summary) + 1)
+            with pending_cols[0]:
+                st.metric("All Pending", pending_all,
+                          delta=f"{pending_all / max(total_all, 1) * 100:.0f}% of total")
+            for i, row in tier_summary.iterrows():
+                with pending_cols[i + 1]:
+                    st.metric(f"{row['subscription_tier']}", row['pending'])
+
+        # Subscription tier pie chart
+        col_pie1, col_pie2 = st.columns(2)
+        with col_pie1:
+            fig_sub_tier = px.pie(
+                tier_summary, values='total', names='subscription_tier',
+                title='Subscriptions by Tier', hole=0.45,
+                color_discrete_sequence=CHART_COLORS
+            )
+            fig_sub_tier.update_traces(textinfo='label+percent+value', textposition='outside')
+            apply_chart_theme(fig_sub_tier)
+            st.plotly_chart(fig_sub_tier, use_container_width=True)
+
+        with col_pie2:
+            status_data = pd.DataFrame({
+                'Status': ['Active', 'Pending'],
+                'Count': [active_all, pending_all]
+            })
+            fig_sub_status = px.pie(
+                status_data, values='Count', names='Status',
+                title='Active vs Pending Subscriptions', hole=0.45,
+                color_discrete_sequence=['#06d6a0', '#f77f00']
+            )
+            fig_sub_status.update_traces(textinfo='label+percent+value', textposition='outside')
+            apply_chart_theme(fig_sub_status)
+            st.plotly_chart(fig_sub_status, use_container_width=True)
+
+        st.markdown("---")
+
+
+        # ══════════════════════════════════════════════════════════════
+        # SECTION 2: Active Users — DAU / WAU / MAU (Official Dashboard)
+        # ══════════════════════════════════════════════════════════════
+        st.header("👥 Active Users (DAU / WAU / MAU)")
+        st.caption("Unique users actively utilizing Kiro — daily, weekly, and monthly views with breakdowns")
+
+        # Fetch raw user-level daily data for active user computation
+        query_user_daily = f"""
+        SELECT
+            date,
+            userid,
+            client_type,
+            subscription_tier
+        FROM {table_name}
+        {where_clause}
+        """
+        df_user_daily = fetch_data(query_user_daily)
+        df_user_daily['date'] = pd.to_datetime(df_user_daily['date'])
+
+        # Compute DAU, WAU, MAU
+        dau, wau, mau = compute_wau_mau(df_user_daily)
+
+        # Time granularity selector
+        time_view = st.radio("Time Granularity", ['Daily (DAU)', 'Weekly (WAU)', 'Monthly (MAU)'],
+                             horizontal=True, key='active_users_granularity')
+
+        if time_view == 'Daily (DAU)':
+            fig_au = px.line(dau, x='date', y='active_users',
+                             title='Daily Active Users (DAU)', markers=True,
+                             labels={'active_users': 'Active Users', 'date': 'Date'},
+                             color_discrete_sequence=['#4361ee'])
+            fig_au.update_traces(line=dict(width=2.5), marker=dict(size=5))
+            apply_chart_theme(fig_au)
+            st.plotly_chart(fig_au, use_container_width=True)
+        elif time_view == 'Weekly (WAU)':
+            fig_au = px.bar(wau, x='week', y='active_users',
+                            title='Weekly Active Users (WAU)',
+                            labels={'active_users': 'Active Users', 'week': 'Week'},
+                            color_discrete_sequence=['#3a0ca3'])
+            fig_au.update_traces(marker_line_width=0)
+            apply_chart_theme(fig_au)
+            st.plotly_chart(fig_au, use_container_width=True)
+        else:
+            fig_au = px.bar(mau, x='month', y='active_users',
+                            title='Monthly Active Users (MAU)',
+                            labels={'active_users': 'Active Users', 'month': 'Month'},
+                            color_discrete_sequence=['#7209b7'])
+            fig_au.update_traces(marker_line_width=0)
+            apply_chart_theme(fig_au)
+            st.plotly_chart(fig_au, use_container_width=True)
+
+        # Breakdown by client type and subscription tier
+        col_au1, col_au2 = st.columns(2)
+
+        with col_au1:
+            st.subheader("By Client Type")
+            df_user_daily['week'] = df_user_daily['date'].dt.isocalendar().year.astype(str) + '-W' + \
+                                    df_user_daily['date'].dt.isocalendar().week.astype(str).str.zfill(2)
+            df_user_daily['month'] = df_user_daily['date'].dt.to_period('M').astype(str)
+
+            if time_view == 'Daily (DAU)':
+                au_ct = df_user_daily.groupby(['date', 'client_type'])['userid'].nunique().reset_index()
+                au_ct.columns = ['date', 'client_type', 'active_users']
+                fig_au_ct = px.line(au_ct, x='date', y='active_users', color='client_type',
+                                   title='Active Users by Client Type', markers=True,
+                                   color_discrete_sequence=CHART_COLORS)
+            elif time_view == 'Weekly (WAU)':
+                au_ct = df_user_daily.groupby(['week', 'client_type'])['userid'].nunique().reset_index()
+                au_ct.columns = ['week', 'client_type', 'active_users']
+                fig_au_ct = px.bar(au_ct, x='week', y='active_users', color='client_type',
+                                  title='Active Users by Client Type', barmode='group',
+                                  color_discrete_sequence=CHART_COLORS)
+            else:
+                au_ct = df_user_daily.groupby(['month', 'client_type'])['userid'].nunique().reset_index()
+                au_ct.columns = ['month', 'client_type', 'active_users']
+                fig_au_ct = px.bar(au_ct, x='month', y='active_users', color='client_type',
+                                  title='Active Users by Client Type', barmode='group',
+                                  color_discrete_sequence=CHART_COLORS)
+            apply_chart_theme(fig_au_ct)
+            st.plotly_chart(fig_au_ct, use_container_width=True)
+
+        with col_au2:
+            st.subheader("By Subscription Tier")
+            if time_view == 'Daily (DAU)':
+                au_tier = df_user_daily.groupby(['date', 'subscription_tier'])['userid'].nunique().reset_index()
+                au_tier.columns = ['date', 'subscription_tier', 'active_users']
+                fig_au_tier = px.line(au_tier, x='date', y='active_users', color='subscription_tier',
+                                     title='Active Users by Tier', markers=True,
+                                     color_discrete_sequence=CHART_COLORS[3:])
+            elif time_view == 'Weekly (WAU)':
+                au_tier = df_user_daily.groupby(['week', 'subscription_tier'])['userid'].nunique().reset_index()
+                au_tier.columns = ['week', 'subscription_tier', 'active_users']
+                fig_au_tier = px.bar(au_tier, x='week', y='active_users', color='subscription_tier',
+                                    title='Active Users by Tier', barmode='group',
+                                    color_discrete_sequence=CHART_COLORS[3:])
+            else:
+                au_tier = df_user_daily.groupby(['month', 'subscription_tier'])['userid'].nunique().reset_index()
+                au_tier.columns = ['month', 'subscription_tier', 'active_users']
+                fig_au_tier = px.bar(au_tier, x='month', y='active_users', color='subscription_tier',
+                                    title='Active Users by Tier', barmode='group',
+                                    color_discrete_sequence=CHART_COLORS[3:])
+            apply_chart_theme(fig_au_tier)
+            st.plotly_chart(fig_au_tier, use_container_width=True)
+
+        st.markdown("---")
+
+
+        # ══════════════════════════════════════════════════════════════
+        # SECTION 3: Credits Consumed — DAU / WAU / MAU (Official Dashboard)
+        # ══════════════════════════════════════════════════════════════
+        st.header("💳 Credits Consumed (Daily / Weekly / Monthly)")
+        st.caption("Total Kiro credits consumed with time-based views and breakdowns by tier and client type")
+
+        # Fetch credits data at daily granularity
+        query_credits_daily = f"""
+        SELECT
+            date,
+            userid,
+            client_type,
+            subscription_tier,
+            TRY_CAST(credits_used AS DOUBLE) as credits_used
+        FROM {table_name}
+        {where_clause}
+        """
+        df_credits_daily = fetch_data(query_credits_daily)
+        df_credits_daily['date'] = pd.to_datetime(df_credits_daily['date'])
+        df_credits_daily['credits_used'] = df_credits_daily['credits_used'].apply(safe_float)
+        df_credits_daily['week'] = df_credits_daily['date'].dt.isocalendar().year.astype(str) + '-W' + \
+                                   df_credits_daily['date'].dt.isocalendar().week.astype(str).str.zfill(2)
+        df_credits_daily['month'] = df_credits_daily['date'].dt.to_period('M').astype(str)
+
+        credits_view = st.radio("Time Granularity", ['Daily', 'Weekly', 'Monthly'],
+                                horizontal=True, key='credits_granularity')
+
+        if credits_view == 'Daily':
+            cr_agg = df_credits_daily.groupby('date')['credits_used'].sum().reset_index()
+            fig_cr = px.line(cr_agg, x='date', y='credits_used',
+                             title='Daily Credits Consumed', markers=True,
+                             labels={'credits_used': 'Credits', 'date': 'Date'},
+                             color_discrete_sequence=['#06d6a0'])
+            fig_cr.update_traces(line=dict(width=2.5), marker=dict(size=5))
+        elif credits_view == 'Weekly':
+            cr_agg = df_credits_daily.groupby('week')['credits_used'].sum().reset_index()
+            fig_cr = px.bar(cr_agg, x='week', y='credits_used',
+                            title='Weekly Credits Consumed',
+                            labels={'credits_used': 'Credits', 'week': 'Week'},
+                            color_discrete_sequence=['#06d6a0'])
+            fig_cr.update_traces(marker_line_width=0)
+        else:
+            cr_agg = df_credits_daily.groupby('month')['credits_used'].sum().reset_index()
+            fig_cr = px.bar(cr_agg, x='month', y='credits_used',
+                            title='Monthly Credits Consumed',
+                            labels={'credits_used': 'Credits', 'month': 'Month'},
+                            color_discrete_sequence=['#06d6a0'])
+            fig_cr.update_traces(marker_line_width=0)
+        apply_chart_theme(fig_cr)
+        st.plotly_chart(fig_cr, use_container_width=True)
+
+        # Breakdown by tier and client type
+        col_cr1, col_cr2 = st.columns(2)
+
+        with col_cr1:
+            st.subheader("Credits by Subscription Tier")
+            if credits_view == 'Daily':
+                cr_tier = df_credits_daily.groupby(['date', 'subscription_tier'])['credits_used'].sum().reset_index()
+                fig_cr_tier = px.line(cr_tier, x='date', y='credits_used', color='subscription_tier',
+                                     title='Credits by Tier', markers=True,
+                                     color_discrete_sequence=CHART_COLORS)
+            elif credits_view == 'Weekly':
+                cr_tier = df_credits_daily.groupby(['week', 'subscription_tier'])['credits_used'].sum().reset_index()
+                fig_cr_tier = px.bar(cr_tier, x='week', y='credits_used', color='subscription_tier',
+                                    title='Credits by Tier', barmode='group',
+                                    color_discrete_sequence=CHART_COLORS)
+            else:
+                cr_tier = df_credits_daily.groupby(['month', 'subscription_tier'])['credits_used'].sum().reset_index()
+                fig_cr_tier = px.bar(cr_tier, x='month', y='credits_used', color='subscription_tier',
+                                    title='Credits by Tier', barmode='group',
+                                    color_discrete_sequence=CHART_COLORS)
+            apply_chart_theme(fig_cr_tier)
+            st.plotly_chart(fig_cr_tier, use_container_width=True)
+
+        with col_cr2:
+            st.subheader("Credits by Client Type")
+            if credits_view == 'Daily':
+                cr_ct = df_credits_daily.groupby(['date', 'client_type'])['credits_used'].sum().reset_index()
+                fig_cr_ct = px.line(cr_ct, x='date', y='credits_used', color='client_type',
+                                   title='Credits by Client Type', markers=True,
+                                   color_discrete_sequence=CHART_COLORS[3:])
+            elif credits_view == 'Weekly':
+                cr_ct = df_credits_daily.groupby(['week', 'client_type'])['credits_used'].sum().reset_index()
+                fig_cr_ct = px.bar(cr_ct, x='week', y='credits_used', color='client_type',
+                                  title='Credits by Client Type', barmode='group',
+                                  color_discrete_sequence=CHART_COLORS[3:])
+            else:
+                cr_ct = df_credits_daily.groupby(['month', 'client_type'])['credits_used'].sum().reset_index()
+                fig_cr_ct = px.bar(cr_ct, x='month', y='credits_used', color='client_type',
+                                  title='Credits by Client Type', barmode='group',
+                                  color_discrete_sequence=CHART_COLORS[3:])
+            apply_chart_theme(fig_cr_ct)
+            st.plotly_chart(fig_cr_ct, use_container_width=True)
+
+        st.markdown("---")
+
+
+        # ══════════════════════════════════════════════════════════════
+        # SECTION 4: Overall Metrics (existing)
+        # ══════════════════════════════════════════════════════════════
         st.header("📈 Overall Metrics")
 
         query_overall = f"""
         SELECT
             COUNT(DISTINCT userid) as total_users,
+            COUNT(DISTINCT profileid) as total_profiles,
             SUM(TRY_CAST(total_messages AS INTEGER)) as total_messages,
             SUM(TRY_CAST(chat_conversations AS INTEGER)) as total_conversations,
             SUM(TRY_CAST(credits_used AS DOUBLE)) as total_credits,
             SUM(TRY_CAST(overage_credits_used AS DOUBLE)) as total_overage
         FROM {table_name}
+        {where_clause}
         """
         df_overall = fetch_data(query_overall)
 
-        col1, col2, col3, col4, col5 = st.columns(5)
+        col1, col2, col3, col4, col5, col6 = st.columns(6)
         with col1:
             st.metric("Total Users", safe_int(df_overall['total_users'].iloc[0]),
                       help="Unique users who have used Kiro")
         with col2:
+            st.metric("Total Profiles", safe_int(df_overall['total_profiles'].iloc[0]),
+                      help="Unique Kiro profiles associated with user activity")
+        with col3:
             st.metric("Total Messages", f"{safe_int(df_overall['total_messages'].iloc[0]):,}",
                       help="Total messages sent to Kiro")
-        with col3:
+        with col4:
             st.metric("Chat Conversations", f"{safe_int(df_overall['total_conversations'].iloc[0]):,}",
                       help="Total chat conversations initiated")
-        with col4:
+        with col5:
             st.metric("Credits Used", f"{safe_float(df_overall['total_credits'].iloc[0]):,.1f}",
                       help="Total credits consumed across all users and client types")
-        with col5:
+        with col6:
             st.metric("Overage Credits", f"{safe_float(df_overall['total_overage'].iloc[0]):,.1f}",
                       help="Total overage credits consumed")
 
         st.markdown("---")
 
-        # ── Client Type Breakdown ──
+        # ══════════════════════════════════════════════════════════════
+        # SECTION 5: Usage by Client Type (existing)
+        # ══════════════════════════════════════════════════════════════
         st.header("🖥️ Usage by Client Type")
 
         query_client = f"""
@@ -331,6 +754,7 @@ def main():
             SUM(TRY_CAST(chat_conversations AS INTEGER)) as total_conversations,
             SUM(TRY_CAST(credits_used AS DOUBLE)) as total_credits
         FROM {table_name}
+        {where_clause}
         GROUP BY client_type
         ORDER BY total_messages DESC
         """
@@ -367,7 +791,9 @@ def main():
 
         st.markdown("---")
 
-        # ── Top 10 Users ──
+        # ══════════════════════════════════════════════════════════════
+        # SECTION 6: Top 10 Users by Messages (existing)
+        # ══════════════════════════════════════════════════════════════
         st.header("🏆 Top 10 Users by Messages")
 
         query_top_users = f"""
@@ -377,6 +803,7 @@ def main():
             SUM(TRY_CAST(chat_conversations AS INTEGER)) as total_conversations,
             SUM(TRY_CAST(credits_used AS DOUBLE)) as total_credits
         FROM {table_name}
+        {where_clause}
         GROUP BY userid
         ORDER BY total_messages DESC
         LIMIT 10
@@ -413,7 +840,10 @@ def main():
 
         st.markdown("---")
 
-        # ── Daily Activity Trends ──
+
+        # ══════════════════════════════════════════════════════════════
+        # SECTION 7: Daily Activity Trends (existing)
+        # ══════════════════════════════════════════════════════════════
         st.header("📅 Daily Activity Trends")
 
         query_daily = f"""
@@ -424,6 +854,7 @@ def main():
             SUM(TRY_CAST(credits_used AS DOUBLE)) as credits,
             COUNT(DISTINCT userid) as active_users
         FROM {table_name}
+        {where_clause}
         GROUP BY date
         ORDER BY date
         """
@@ -466,7 +897,9 @@ def main():
 
         st.markdown("---")
 
-        # ── Daily Trends by Client Type ──
+        # ══════════════════════════════════════════════════════════════
+        # SECTION 8: Daily Trends by Client Type (existing)
+        # ══════════════════════════════════════════════════════════════
         st.header("📊 Daily Trends by Client Type")
 
         query_daily_client = f"""
@@ -476,6 +909,7 @@ def main():
             SUM(TRY_CAST(total_messages AS INTEGER)) as messages,
             SUM(TRY_CAST(chat_conversations AS INTEGER)) as conversations
         FROM {table_name}
+        {where_clause}
         GROUP BY date, client_type
         ORDER BY date
         """
@@ -509,7 +943,10 @@ def main():
 
         st.markdown("---")
 
-        # ── Credits Analysis ──
+
+        # ══════════════════════════════════════════════════════════════
+        # SECTION 9: Credits Analysis (existing)
+        # ══════════════════════════════════════════════════════════════
         st.header("💰 Credits Analysis")
 
         query_credits_user = f"""
@@ -520,6 +957,7 @@ def main():
             MAX(TRY_CAST(overage_cap AS DOUBLE)) as overage_cap,
             MAX(overage_enabled) as overage_enabled
         FROM {table_name}
+        {where_clause}
         GROUP BY userid
         ORDER BY total_credits DESC
         """
@@ -547,7 +985,6 @@ def main():
             st.plotly_chart(fig_credits, use_container_width=True)
 
         with col2:
-            # Credits vs overage — credits_used is base plan, overage_credits_used is additional
             df_credits_summary = pd.DataFrame({
                 'Category': ['Base Credits', 'Overage Credits'],
                 'Amount': [
@@ -574,6 +1011,7 @@ def main():
             DATE_FORMAT(DATE_PARSE(date, '%Y-%m-%d'), '%Y-%m') as month,
             SUM(TRY_CAST(credits_used AS DOUBLE)) as credits_used
         FROM {table_name}
+        {where_clause}
         GROUP BY userid, DATE_FORMAT(DATE_PARSE(date, '%Y-%m-%d'), '%Y-%m')
         ORDER BY month, userid
         """
@@ -584,24 +1022,22 @@ def main():
         umap_monthly = get_usernames_batch(df_credits_monthly['userid'].unique().tolist())
         df_credits_monthly['User'] = df_credits_monthly['userid'].map(umap_monthly)
 
-        # Pivot: rows = users, columns = months
         df_pivot = df_credits_monthly.pivot_table(
             index='User', columns='month', values='credits_used',
             aggfunc='sum', fill_value=0
         )
-        # Sort columns chronologically
         df_pivot = df_pivot[sorted(df_pivot.columns)]
-        # Add a total column
         df_pivot['Total'] = df_pivot.sum(axis=1)
         df_pivot = df_pivot.sort_values('Total', ascending=False)
-        # Round for display
         df_pivot = df_pivot.round(1)
 
         st.dataframe(df_pivot, use_container_width=True, height=400)
 
         st.markdown("---")
 
-        # ── Subscription Tier Breakdown ──
+        # ══════════════════════════════════════════════════════════════
+        # SECTION 10: Subscription Tier Breakdown (existing)
+        # ══════════════════════════════════════════════════════════════
         st.header("🎫 Subscription Tier Breakdown")
 
         query_tier = f"""
@@ -611,6 +1047,7 @@ def main():
             SUM(TRY_CAST(total_messages AS INTEGER)) as total_messages,
             SUM(TRY_CAST(credits_used AS DOUBLE)) as total_credits
         FROM {table_name}
+        {where_clause}
         GROUP BY subscription_tier
         ORDER BY total_messages DESC
         """
@@ -646,7 +1083,68 @@ def main():
 
         st.markdown("---")
 
-        # ── User Engagement Analysis ──
+
+        # ══════════════════════════════════════════════════════════════
+        # SECTION 10b: Profile Distribution
+        # ══════════════════════════════════════════════════════════════
+        st.header("🆔 Profile Distribution")
+        st.caption("Kiro profiles associated with user activity — users per profile and activity breakdown")
+
+        query_profiles = f"""
+        SELECT
+            profileid,
+            COUNT(DISTINCT userid) as unique_users,
+            SUM(TRY_CAST(total_messages AS INTEGER)) as total_messages,
+            SUM(TRY_CAST(credits_used AS DOUBLE)) as total_credits
+        FROM {table_name}
+        {where_clause}
+        GROUP BY profileid
+        ORDER BY unique_users DESC
+        """
+        df_profiles = fetch_data(query_profiles)
+        df_profiles['unique_users'] = df_profiles['unique_users'].apply(safe_int)
+        df_profiles['total_messages'] = df_profiles['total_messages'].apply(safe_int)
+        df_profiles['total_credits'] = df_profiles['total_credits'].apply(safe_float)
+        df_profiles['profileid'] = df_profiles['profileid'].fillna('Unknown')
+
+        col_p1, col_p2 = st.columns(2)
+        with col_p1:
+            fig_profile_users = px.bar(
+                df_profiles.head(15), x='profileid', y='unique_users',
+                title='Users per Profile (Top 15)', color='unique_users',
+                color_continuous_scale='Blues',
+                labels={'unique_users': 'Users', 'profileid': 'Profile ID'}
+            )
+            fig_profile_users.update_traces(marker_line_width=0)
+            fig_profile_users.update_layout(xaxis_tickangle=-45, showlegend=False, coloraxis_showscale=False)
+            apply_chart_theme(fig_profile_users)
+            st.plotly_chart(fig_profile_users, use_container_width=True)
+
+        with col_p2:
+            fig_profile_credits = px.bar(
+                df_profiles.head(15), x='profileid', y='total_credits',
+                title='Credits per Profile (Top 15)', color='total_credits',
+                color_continuous_scale='Oranges',
+                labels={'total_credits': 'Credits', 'profileid': 'Profile ID'}
+            )
+            fig_profile_credits.update_traces(marker_line_width=0)
+            fig_profile_credits.update_layout(xaxis_tickangle=-45, showlegend=False, coloraxis_showscale=False)
+            apply_chart_theme(fig_profile_credits)
+            st.plotly_chart(fig_profile_credits, use_container_width=True)
+
+        # Profile summary table
+        st.subheader("📋 Profile Summary")
+        df_profile_display = df_profiles[['profileid', 'unique_users', 'total_messages', 'total_credits']].copy()
+        df_profile_display.columns = ['Profile ID', 'Users', 'Messages', 'Credits']
+        df_profile_display['Credits'] = df_profile_display['Credits'].round(1)
+        st.dataframe(df_profile_display, use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+
+
+        # ══════════════════════════════════════════════════════════════
+        # SECTION 11: User Engagement Analysis (existing)
+        # ══════════════════════════════════════════════════════════════
         st.header("👥 User Engagement Analysis")
 
         query_users = f"""
@@ -656,6 +1154,7 @@ def main():
             SUM(TRY_CAST(chat_conversations AS INTEGER)) as total_conversations,
             SUM(TRY_CAST(credits_used AS DOUBLE)) as total_credits
         FROM {table_name}
+        {where_clause}
         GROUP BY userid
         ORDER BY total_messages DESC
         """
@@ -732,10 +1231,12 @@ def main():
         query_activity = f"""
         SELECT
             userid,
+            MAX(profileid) as profileid,
             MAX(date) as last_active_date,
             MIN(date) as first_active_date,
             COUNT(DISTINCT date) as active_days
         FROM {table_name}
+        {where_clause}
         GROUP BY userid
         """
         df_activity = fetch_data(query_activity)
@@ -752,6 +1253,7 @@ def main():
             df_users[['userid', 'category', 'total_messages', 'total_credits']],
             on='userid', how='left'
         )
+        df_act_merged['profileid'] = df_act_merged['profileid'].fillna('')
 
         col1, col2 = st.columns(2)
         with col1:
@@ -782,10 +1284,10 @@ def main():
 
         # Detailed table
         st.markdown("#### 📋 Detailed User Activity Table")
-        df_display = df_act_merged[['username', 'category', 'last_active_date',
+        df_display = df_act_merged[['username', 'profileid', 'category', 'last_active_date',
                                      'days_since_last_active', 'active_days',
                                      'total_messages', 'total_credits']].copy()
-        df_display.columns = ['User', 'Category', 'Last Active', 'Days Ago',
+        df_display.columns = ['User', 'Profile', 'Category', 'Last Active', 'Days Ago',
                               'Active Days', 'Messages', 'Credits']
         df_display['Last Active'] = df_display['Last Active'].dt.strftime('%Y-%m-%d')
         df_display = df_display.sort_values('Days Ago')
@@ -829,19 +1331,21 @@ def main():
 
         st.markdown("---")
 
-        # ── User Engagement Funnel ──
+        # ══════════════════════════════════════════════════════════════
+        # SECTION 12: User Engagement Funnel (existing)
+        # ══════════════════════════════════════════════════════════════
         st.header("🔻 User Engagement Funnel")
 
         total_users = len(df_users)
         users_with_messages = len(df_users[df_users['total_messages'] > 0])
         users_with_convos = len(df_users[df_users['total_conversations'] > 0])
-        active_users = len(df_users[df_users['total_messages'] >= 20])
+        active_users_count = len(df_users[df_users['total_messages'] >= 20])
         power_users = len(df_users[df_users['total_messages'] >= 100])
 
         funnel_data = pd.DataFrame({
             'Stage': ['All Users', 'Sent Messages', 'Had Conversations',
                       'Active Users (20+ msgs)', 'Power Users (100+ msgs)'],
-            'Count': [total_users, users_with_messages, users_with_convos, active_users, power_users]
+            'Count': [total_users, users_with_messages, users_with_convos, active_users_count, power_users]
         })
         funnel_data['Percentage'] = (funnel_data['Count'] / max(total_users, 1) * 100).round(1)
 
@@ -872,9 +1376,9 @@ def main():
                 st.markdown(f"**Message Activation:** {users_with_messages / total_users * 100:.1f}%")
                 if users_with_messages > 0:
                     st.markdown(f"**Conversation Rate:** {users_with_convos / users_with_messages * 100:.1f}%")
-                    st.markdown(f"**Active Retention:** {active_users / users_with_messages * 100:.1f}%")
-                if active_users > 0:
-                    st.markdown(f"**Power User Growth:** {power_users / active_users * 100:.1f}%")
+                    st.markdown(f"**Active Retention:** {active_users_count / users_with_messages * 100:.1f}%")
+                if active_users_count > 0:
+                    st.markdown(f"**Power User Growth:** {power_users / active_users_count * 100:.1f}%")
 
     except Exception as e:
         st.error(f"Error fetching data: {str(e)}")

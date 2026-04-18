@@ -37,6 +37,12 @@ variable "identity_store_id" {
   type        = string
 }
 
+variable "prompt_log_s3_uri" {
+  description = "S3 URI where Kiro prompt logs are stored (e.g. s3://my-bucket/kiro-prompt-logs/). Leave empty to disable prompt logging viewer."
+  type        = string
+  default     = ""
+}
+
 variable "tags" {
   description = "Tags to apply to resources"
   type        = map(string)

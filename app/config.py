@@ -14,6 +14,10 @@ ATHENA_OUTPUT_BUCKET = os.getenv('ATHENA_OUTPUT_BUCKET', '')
 GLUE_TABLE_NAME = os.getenv('GLUE_TABLE_NAME', '')
 IDENTITY_STORE_ID = os.getenv('IDENTITY_STORE_ID', '')
 
+# Prompt Logging Configuration
+# S3 bucket/prefix where Kiro prompt logs are stored (e.g. s3://my-bucket/kiro-prompt-logs/)
+PROMPT_LOG_S3_URI = os.getenv('PROMPT_LOG_S3_URI', '')
+
 # Streamlit Configuration
 PAGE_TITLE = "Kiro Users Report"
 PAGE_ICON = "⚡"

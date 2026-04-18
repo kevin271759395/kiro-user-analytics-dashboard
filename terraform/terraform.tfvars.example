@@ -18,6 +18,11 @@ glue_crawler_schedule = "cron(0 2 * * ? *)"
 # Identity Store ID for username lookup (required — from IAM Identity Center)
 identity_store_id = "d-xxxxxxxxxx"
 
+# Prompt Logging — S3 URI where Kiro stores prompt logs (optional)
+# Enable logging in Kiro Console → Settings → Logging first, then set the same S3 URI here.
+# Leave empty to disable the Prompt Logging viewer in the dashboard.
+prompt_log_s3_uri = ""
+
 # Tags
 tags = {
   Project     = "Kiro User Report"

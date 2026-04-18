@@ -27,3 +27,8 @@ output "s3_data_path" {
   description = "Full S3 data path including account ID and region"
   value       = "s3://${local.s3_data_path}/"
 }
+
+output "prompt_log_s3_uri" {
+  description = "S3 URI for Kiro prompt logs"
+  value       = var.prompt_log_s3_uri
+}
