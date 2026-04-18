@@ -75,6 +75,149 @@ Terraform 需要创建和管理以下资源，因此执行 `terraform apply` 的
 
 ---
 
+#### 汇总部署执行所需的权限（如果在Ec2上）
+需要的完整权限策略：
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "S3Full",
+      "Effect": "Allow",
+      "Action": [
+        "s3:CreateBucket",
+        "s3:DeleteBucket",
+        "s3:ListBucket",
+        "s3:GetBucketPolicy",
+        "s3:PutBucketPolicy",
+        "s3:DeleteBucketPolicy",
+        "s3:GetBucketAcl",
+        "s3:PutBucketAcl",
+        "s3:GetBucketCORS",
+        "s3:PutBucketCORS",
+        "s3:GetBucketVersioning",
+        "s3:PutBucketVersioning",
+        "s3:GetBucketPublicAccessBlock",
+        "s3:PutBucketPublicAccessBlock",
+        "s3:GetEncryptionConfiguration",
+        "s3:PutEncryptionConfiguration",
+        "s3:GetLifecycleConfiguration",
+        "s3:PutLifecycleConfiguration",
+        "s3:GetBucketTagging",
+        "s3:PutBucketTagging",
+        "s3:GetBucketLogging",
+        "s3:PutBucketLogging",
+        "s3:GetBucketObjectLockConfiguration",
+        "s3:GetBucketRequestPayment",
+        "s3:GetBucketWebsite",
+        "s3:GetAccelerateConfiguration",
+        "s3:GetReplicationConfiguration",
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:ListAllMyBuckets",
+        "s3:GetBucketLocation"
+      ],
+      "Resource": [
+        "arn:aws:s3:::kiro-user-report-dashboard-*",
+        "arn:aws:s3:::kiro-user-report-dashboard-*/*"
+      ]
+    },
+    {
+      "Sid": "IAMRolesAndPolicies",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:GetRole",
+        "iam:ListRolePolicies",
+        "iam:ListAttachedRolePolicies",
+        "iam:ListInstanceProfilesForRole",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:GetRolePolicy",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:PassRole",
+        "iam:TagRole",
+        "iam:UntagRole",
+        "iam:CreateInstanceProfile",
+        "iam:DeleteInstanceProfile",
+        "iam:GetInstanceProfile",
+        "iam:AddRoleToInstanceProfile",
+        "iam:RemoveRoleFromInstanceProfile",
+        "iam:CreatePolicy",
+        "iam:DeletePolicy",
+        "iam:GetPolicy",
+        "iam:GetPolicyVersion",
+        "iam:ListPolicyVersions",
+        "iam:CreatePolicyVersion",
+        "iam:DeletePolicyVersion",
+        "iam:TagPolicy",
+        "iam:UntagPolicy",
+        "iam:CreateUser",
+        "iam:DeleteUser",
+        "iam:GetUser",
+        "iam:TagUser",
+        "iam:UntagUser",
+        "iam:AttachUserPolicy",
+        "iam:DetachUserPolicy",
+        "iam:ListAttachedUserPolicies",
+        "iam:ListUserPolicies"
+      ],
+      "Resource": [
+        "arn:aws:iam::154486397967:role/kiro-user-report-dashboard-*",
+        "arn:aws:iam::154486397967:policy/kiro-user-report-dashboard-*",
+        "arn:aws:iam::154486397967:instance-profile/kiro-user-report-dashboard-*",
+        "arn:aws:iam::154486397967:user/kiro-user-report-dashboard-*"
+      ]
+    },
+    {
+      "Sid": "GlueCrawlerAndCatalog",
+      "Effect": "Allow",
+      "Action": [
+        "glue:CreateDatabase",
+        "glue:DeleteDatabase",
+        "glue:GetDatabase",
+        "glue:UpdateDatabase",
+        "glue:CreateCrawler",
+        "glue:DeleteCrawler",
+        "glue:GetCrawler",
+        "glue:UpdateCrawler",
+        "glue:StartCrawler",
+        "glue:StopCrawler",
+        "glue:TagResource",
+        "glue:UntagResource",
+        "glue:GetTags"
+      ],
+      "Resource": [
+        "arn:aws:glue:*:154486397967:catalog",
+        "arn:aws:glue:*:154486397967:database/kiro-user-report*",
+        "arn:aws:glue:*:154486397967:crawler/kiro-user-report-dashboard-*"
+      ]
+    },
+    {
+      "Sid": "AthenaWorkgroup",
+      "Effect": "Allow",
+      "Action": [
+        "athena:CreateWorkGroup",
+        "athena:DeleteWorkGroup",
+        "athena:GetWorkGroup",
+        "athena:UpdateWorkGroup",
+        "athena:TagResource",
+        "athena:UntagResource",
+        "athena:ListTagsForResource"
+      ],
+      "Resource": "arn:aws:athena:*:154486397967:workgroup/kiro-user-report-dashboard-*"
+    }
+  ]
+}
+```
+
+把这个策略交给你的 AWS 管理员，让他们附加到EC2的角色（例如`kiro-reports-role`） 上。
+
+---
 #### 三、应用运行时权限（app 角色/用户）
 
 Terraform 已经通过 `athena_access_policy` 和 `prompt_log_s3_policy` 定义了应用所需的权限，梳理如下：
@@ -122,11 +265,72 @@ cp terraform/terraform.tfvars.example terraform/terraform.tfvars
 
 # 3. 启动仪表板
 cd app
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
 仪表板将在 `http://localhost:8501` 上可用。
+
+### 长期持久运行
+最简单的方式是用 `nohup` 或 `screen`/`tmux`，这样断开 SSH 后程序继续运行。
+
+**方案 A：nohup（最简单）**
+
+```bash
+cd /home/ec2-user/kiro-user-analytics-dashboard/app
+source venv/bin/activate
+nohup streamlit run app.py --server.port 8501 --server.address 0.0.0.0 > streamlit.log 2>&1 &
+```
+
+查看日志：`tail -f streamlit.log`
+停止程序：`kill $(pgrep -f "streamlit run")`
+
+**方案 B：tmux（推荐，方便随时回来查看）**
+
+```bash
+# 创建一个命名会话
+tmux new -s dashboard
+
+# 在 tmux 里运行
+cd /home/ec2-user/kiro-user-analytics-dashboard/app
+source venv/bin/activate
+streamlit run app.py --server.port 8501 --server.address 0.0.0.0
+```
+
+然后按 `Ctrl+B` 再按 `D` 脱离会话。下次 SSH 回来用 `tmux attach -t dashboard` 重新接入。
+
+**方案 C：systemd（生产环境推荐，开机自启）**
+
+```bash
+sudo tee /etc/systemd/system/streamlit-dashboard.service << 'EOF'
+[Unit]
+Description=Kiro User Report Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/kiro-user-analytics-dashboard/app
+ExecStart=/home/ec2-user/kiro-user-analytics-dashboard/app/venv/bin/streamlit run app.py --server.port 8501 --server.address 0.0.0.0
+Restart=always
+RestartSec=5
+EnvironmentFile=/home/ec2-user/kiro-user-analytics-dashboard/app/.env
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable streamlit-dashboard
+sudo systemctl start streamlit-dashboard
+```
+
+查看状态：`sudo systemctl status streamlit-dashboard`
+查看日志：`sudo journalctl -u streamlit-dashboard -f`
+
+别忘了在 EC2 安全组里开放 8501 端口，否则外部访问不了。
 
 ## 配置
 

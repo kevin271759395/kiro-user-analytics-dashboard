@@ -1,4 +1,5 @@
 import os
+import logging
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -143,12 +144,17 @@ def resolve_table_name():
 def get_username(userid):
     if not IDENTITY_STORE_ID:
         return userid
+    # Strip IdentityStoreId prefix if present (e.g. "d-906xxx.uuid" → "uuid")
+    lookup_id = userid
+    if '.' in userid:
+        lookup_id = userid.split('.', 1)[1]
     try:
         client = get_identity_store_client()
-        response = client.describe_user(IdentityStoreId=IDENTITY_STORE_ID, UserId=userid)
+        response = client.describe_user(IdentityStoreId=IDENTITY_STORE_ID, UserId=lookup_id)
         return response.get('UserName') or response.get('DisplayName') or \
                response.get('Emails', [{}])[0].get('Value') or userid
-    except Exception:
+    except Exception as e:
+        logging.warning(f"Failed to resolve username for '{userid}' (lookup_id='{lookup_id}'): {e}")
         return userid
 
 @st.cache_data(ttl=3600)
