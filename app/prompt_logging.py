@@ -509,8 +509,9 @@ def render_prompt_logging_page(apply_chart_theme_fn, chart_colors, theme_colors,
     display_name_map = _build_display_name_map(list(all_user_ids), get_username_fn)
 
     # ── Tab navigation ──
-    tab_chat, tab_inline, tab_timeline = st.tabs([
-        "💬 Chat Conversations", "⚡ Inline Suggestions", "📊 Activity Timeline"
+    tab_chat, tab_inline, tab_ai_coding, tab_timeline = st.tabs([
+        "💬 Chat Conversations", "⚡ Inline Suggestions",
+        "🤖 AI Coding Acceptance", "📊 Activity Timeline"
     ])
 
     # ══════════════════════════════════════════════════════════════
@@ -528,7 +529,14 @@ def render_prompt_logging_page(apply_chart_theme_fn, chart_colors, theme_colors,
                            chart_colors, theme_colors, display_name_map)
 
     # ══════════════════════════════════════════════════════════════
-    # TAB 3: Activity Timeline
+    # TAB 3: AI Coding Acceptance
+    # ══════════════════════════════════════════════════════════════
+    with tab_ai_coding:
+        _render_ai_coding_tab(df_inline, df_chat, apply_chart_theme_fn,
+                              chart_colors, theme_colors, display_name_map)
+
+    # ══════════════════════════════════════════════════════════════
+    # TAB 4: Activity Timeline
     # ══════════════════════════════════════════════════════════════
     with tab_timeline:
         _render_timeline_tab(df_inline, df_chat, apply_chart_theme_fn,
@@ -1028,3 +1036,278 @@ def _render_timeline_tab(df_inline, df_chat, apply_chart_theme_fn,
         fig_trigger.update_traces(textinfo='label+percent+value', textposition='outside')
         apply_chart_theme_fn(fig_trigger)
         st.plotly_chart(fig_trigger, use_container_width=True)
+
+
+# ── AI Coding Acceptance tab ────────────────────────────────────────
+
+def _extract_code_lines_from_response(text: str) -> int:
+    """Count lines inside fenced code blocks (``` ... ```) in a markdown string."""
+    if not text:
+        return 0
+    # Match fenced code blocks with optional language tag
+    blocks = re.findall(r'```[^\n]*\n(.*?)```', text, re.DOTALL)
+    return sum(len(block.splitlines()) for block in blocks)
+
+
+def _count_completion_lines(completions) -> int:
+    """Count total lines across all completions in an inline suggestion record."""
+    if not completions:
+        return 0
+    if isinstance(completions, list):
+        return sum(len(str(c).splitlines()) for c in completions)
+    return len(str(completions).splitlines())
+
+
+def _render_ai_coding_tab(df_inline, df_chat, apply_chart_theme_fn,
+                           chart_colors, theme_colors, display_name_map=None):
+    """Render the AI Coding Acceptance metrics tab."""
+
+    st.markdown("#### 🤖 AI Coding Acceptance")
+    st.caption(
+        "基于 Prompt Log 数据统计 AI 编码辅助指标。"
+        "内联补全仅记录**已接受**的建议；对话代码量为 Kiro 回复中提取的代码块行数（非采纳量）。"
+    )
+
+    has_inline = not df_inline.empty
+    has_chat = not df_chat.empty
+
+    if not has_inline and not has_chat:
+        st.info("No log data available.")
+        return
+
+    # ── Pre-compute per-record metrics ──────────────────────────────
+
+    df_i = pd.DataFrame()
+    if has_inline:
+        df_i = df_inline.copy()
+        df_i['date'] = df_i['timestamp'].dt.date
+        df_i['accepted_lines'] = df_i['completions'].apply(_count_completion_lines)
+
+    df_c = pd.DataFrame()
+    if has_chat:
+        df_c = df_chat.copy()
+        df_c['date'] = df_c['timestamp'].dt.date
+        df_c['generated_code_lines'] = df_c['assistantResponse'].apply(
+            _extract_code_lines_from_response
+        )
+
+    # ── Summary KPI cards ───────────────────────────────────────────
+    st.markdown("---")
+    k1, k2, k3, k4 = st.columns(4)
+
+    total_accepted_completions = len(df_i) if has_inline else 0
+    total_accepted_lines = int(df_i['accepted_lines'].sum()) if has_inline else 0
+    total_chat_code_lines = int(df_c['generated_code_lines'].sum()) if has_chat else 0
+    total_conversations = df_c['conversationId'].nunique() if has_chat else 0
+
+    with k1:
+        st.metric(
+            "补全接受次数",
+            f"{total_accepted_completions:,}",
+            help="用户接受的内联补全总次数（仅已接受的补全会被记录）"
+        )
+    with k2:
+        st.metric(
+            "补全接受代码行数",
+            f"{total_accepted_lines:,}",
+            help="已接受的内联补全代码总行数"
+        )
+    with k3:
+        st.metric(
+            "对话生成代码行数",
+            f"{total_chat_code_lines:,}",
+            help="Kiro 对话回复中代码块的总行数（含未采纳部分）"
+        )
+    with k4:
+        st.metric(
+            "对话会话数",
+            f"{total_conversations:,}",
+            help="按 conversationId 去重的对话会话总数"
+        )
+
+    st.markdown("---")
+
+    # ── Date granularity selector ────────────────────────────────────
+    granularity = st.radio(
+        "时间粒度", ["Daily", "Weekly", "Monthly"],
+        horizontal=True, key='ai_coding_granularity'
+    )
+
+    def _add_period(df, col='date'):
+        df = df.copy()
+        df[col] = pd.to_datetime(df[col])
+        if granularity == 'Weekly':
+            df['period'] = df[col].dt.isocalendar().year.astype(str) + '-W' + \
+                           df[col].dt.isocalendar().week.astype(str).str.zfill(2)
+        elif granularity == 'Monthly':
+            df['period'] = df[col].dt.to_period('M').astype(str)
+        else:
+            df['period'] = df[col].dt.strftime('%Y-%m-%d')
+        return df
+
+    # ══════════════════════════════════════════════════════════════
+    # SECTION 1: 内联补全接受次数趋势
+    # ══════════════════════════════════════════════════════════════
+    st.subheader("⚡ 内联补全接受次数趋势（CUE 推荐被接受次数）")
+    st.caption("每个时间段内用户接受的内联代码补全次数")
+
+    if has_inline:
+        df_i_p = _add_period(df_i)
+        agg_completions = df_i_p.groupby('period').size().reset_index(name='accepted_count')
+
+        fig_comp = px.bar(
+            agg_completions, x='period', y='accepted_count',
+            title=f'内联补全接受次数（{granularity}）',
+            labels={'period': '时间', 'accepted_count': '接受次数'},
+            color_discrete_sequence=['#4361ee'],
+        )
+        fig_comp.update_traces(marker_line_width=0)
+        apply_chart_theme_fn(fig_comp)
+        st.plotly_chart(fig_comp, use_container_width=True)
+    else:
+        st.info("No inline suggestion data available.")
+
+    # ══════════════════════════════════════════════════════════════
+    # SECTION 2: 内联补全接受代码行数趋势
+    # ══════════════════════════════════════════════════════════════
+    st.subheader("📏 内联补全接受代码行数趋势")
+    st.caption("每个时间段内用户接受的内联补全代码总行数")
+
+    if has_inline:
+        df_i_p = _add_period(df_i)
+        agg_lines = df_i_p.groupby('period')['accepted_lines'].sum().reset_index()
+
+        fig_lines = px.bar(
+            agg_lines, x='period', y='accepted_lines',
+            title=f'内联补全接受代码行数（{granularity}）',
+            labels={'period': '时间', 'accepted_lines': '代码行数'},
+            color_discrete_sequence=['#7209b7'],
+        )
+        fig_lines.update_traces(marker_line_width=0)
+        apply_chart_theme_fn(fig_lines)
+        st.plotly_chart(fig_lines, use_container_width=True)
+    else:
+        st.info("No inline suggestion data available.")
+
+    # ══════════════════════════════════════════════════════════════
+    # SECTION 3: 对话生成代码行数趋势
+    # ══════════════════════════════════════════════════════════════
+    st.subheader("💬 对话生成代码行数趋势")
+    st.caption("Kiro 对话回复中代码块的行数（从 assistantResponse 提取 ``` 代码块）")
+
+    if has_chat:
+        df_c_p = _add_period(df_c)
+        agg_chat_code = df_c_p.groupby('period')['generated_code_lines'].sum().reset_index()
+
+        fig_chat_code = px.line(
+            agg_chat_code, x='period', y='generated_code_lines',
+            title=f'对话生成代码行数（{granularity}）',
+            labels={'period': '时间', 'generated_code_lines': '代码行数'},
+            markers=True,
+            color_discrete_sequence=['#f72585'],
+        )
+        fig_chat_code.update_traces(line=dict(width=2.5), marker=dict(size=6))
+        apply_chart_theme_fn(fig_chat_code)
+        st.plotly_chart(fig_chat_code, use_container_width=True)
+    else:
+        st.info("No chat data available.")
+
+    # ══════════════════════════════════════════════════════════════
+    # SECTION 4: 对话会话数趋势
+    # ══════════════════════════════════════════════════════════════
+    st.subheader("🗂️ 对话会话数趋势")
+    st.caption("按 conversationId 去重的对话会话数，按时间展示")
+
+    if has_chat:
+        df_c_p = _add_period(df_c)
+        agg_convos = df_c_p.groupby('period')['conversationId'].nunique().reset_index()
+        agg_convos.columns = ['period', 'conversations']
+
+        fig_convos = px.line(
+            agg_convos, x='period', y='conversations',
+            title=f'对话会话数（{granularity}）',
+            labels={'period': '时间', 'conversations': '会话数'},
+            markers=True,
+            color_discrete_sequence=['#06d6a0'],
+        )
+        fig_convos.update_traces(line=dict(width=2.5), marker=dict(size=6))
+        apply_chart_theme_fn(fig_convos)
+        st.plotly_chart(fig_convos, use_container_width=True)
+    else:
+        st.info("No chat data available.")
+
+    # ══════════════════════════════════════════════════════════════
+    # SECTION 5: 按用户细分
+    # ══════════════════════════════════════════════════════════════
+    st.markdown("---")
+    st.subheader("👤 按用户细分")
+
+    col_u1, col_u2 = st.columns(2)
+
+    with col_u1:
+        if has_inline:
+            user_inline = df_i.groupby('userId').agg(
+                accepted_count=('accepted_lines', 'count'),
+                accepted_lines=('accepted_lines', 'sum'),
+            ).reset_index()
+            user_inline['displayName'] = user_inline['userId'].map(
+                lambda uid: (display_name_map or {}).get(uid, uid)
+            )
+            user_inline = user_inline.nlargest(15, 'accepted_lines')
+
+            fig_u_inline = px.bar(
+                user_inline, x='accepted_lines', y='displayName', orientation='h',
+                title='Top 15 用户 — 补全接受代码行数',
+                labels={'accepted_lines': '代码行数', 'displayName': '用户'},
+                color='accepted_lines', color_continuous_scale='Blues',
+            )
+            fig_u_inline.update_traces(marker_line_width=0)
+            fig_u_inline.update_layout(
+                yaxis={'categoryorder': 'total ascending'},
+                coloraxis_showscale=False,
+                height=max(250, len(user_inline) * 35 + 80),
+            )
+            apply_chart_theme_fn(fig_u_inline)
+            st.plotly_chart(fig_u_inline, use_container_width=True)
+        else:
+            st.info("No inline data.")
+
+    with col_u2:
+        if has_chat:
+            user_chat = df_c.groupby('userId').agg(
+                generated_code_lines=('generated_code_lines', 'sum'),
+                conversations=('conversationId', 'nunique'),
+            ).reset_index()
+            user_chat['displayName'] = user_chat['userId'].map(
+                lambda uid: (display_name_map or {}).get(uid, uid)
+            )
+            user_chat = user_chat.nlargest(15, 'generated_code_lines')
+
+            fig_u_chat = px.bar(
+                user_chat, x='generated_code_lines', y='displayName', orientation='h',
+                title='Top 15 用户 — 对话生成代码行数',
+                labels={'generated_code_lines': '代码行数', 'displayName': '用户'},
+                color='generated_code_lines', color_continuous_scale='Purples',
+            )
+            fig_u_chat.update_traces(marker_line_width=0)
+            fig_u_chat.update_layout(
+                yaxis={'categoryorder': 'total ascending'},
+                coloraxis_showscale=False,
+                height=max(250, len(user_chat) * 35 + 80),
+            )
+            apply_chart_theme_fn(fig_u_chat)
+            st.plotly_chart(fig_u_chat, use_container_width=True)
+        else:
+            st.info("No chat data.")
+
+    # ── Data note ───────────────────────────────────────────────────
+    with st.expander("ℹ️ 数据说明", expanded=False):
+        st.markdown("""
+        **补全接受次数**：Kiro Prompt Log 仅在用户**接受**内联建议时写入记录，因此此数值等于被接受的补全次数，不含被忽略的建议。
+
+        **补全接受代码行数**：统计每条已接受补全（`completions[0]`）的换行数之和。
+
+        **对话生成代码行数**：从 `assistantResponse` 字段中提取所有 ` ``` ` 围栏代码块的行数之和。这是 Kiro **生成**的代码量，不代表用户实际采纳的行数（Kiro 不记录对话代码的采纳行为）。
+
+        **对话会话数**：按 `conversationId` 去重计数。若日志中 `conversationId` 缺失，系统会按时间间隔（30 分钟）自动拆分会话。
+        """)
