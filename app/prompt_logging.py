@@ -18,6 +18,7 @@ import boto3
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 from config import AWS_REGION, PROMPT_LOG_S3_URI
+from i18n import t
 
 
 # ── S3 helpers ──────────────────────────────────────────────────────
@@ -390,42 +391,34 @@ def _build_display_name_map(user_ids, get_username_fn):
 def render_prompt_logging_page(apply_chart_theme_fn, chart_colors, theme_colors, get_username_fn=None):
     """Render the full Prompt Logging page inside the Streamlit app."""
 
-    st.header("📝 Prompt Logging")
-    st.caption("Browse and search Kiro prompt logs — inline suggestions and chat conversations")
+    st.header(t("pl_header"))
+    st.caption(t("pl_caption"))
 
     if not PROMPT_LOG_S3_URI:
-        st.warning(
-            "⚠️ Prompt log S3 URI not configured. "
-            "Set `PROMPT_LOG_S3_URI` in your `.env` file "
-            "(e.g. `s3://my-bucket/kiro-prompt-logs/`)."
-        )
-        st.info(
-            "📖 To enable prompt logging, follow the guide: "
-            "[Kiro Docs — Logging user prompts]"
-            "(https://kiro.dev/docs/enterprise/monitor-and-track/prompt-logging/)"
-        )
+        st.warning(t("pl_not_configured"))
+        st.info(t("pl_enable_guide"))
         return
 
     # ── Filters ──
-    st.markdown("#### 🔍 Log Filters")
+    st.markdown(f"#### {t('pl_filters')}")
     fc1, fc2, fc3 = st.columns([2, 2, 3])
     with fc1:
-        log_start = st.date_input("From", value=datetime.utcnow().date() - timedelta(days=7),
+        log_start = st.date_input(t("pl_from"), value=datetime.utcnow().date() - timedelta(days=7),
                                   key='pl_start')
     with fc2:
-        log_end = st.date_input("To", value=datetime.utcnow().date(), key='pl_end')
+        log_end = st.date_input(t("pl_to"), value=datetime.utcnow().date(), key='pl_end')
     with fc3:
-        search_query = st.text_input("🔎 Search prompts / responses / filenames",
+        search_query = st.text_input(t("pl_search"),
                                      key='pl_search',
-                                     placeholder="Type keywords to filter…")
+                                     placeholder=t("pl_search_placeholder"))
 
     # ── Load files ──
     with st.spinner("Listing log files…"):
         files = list_log_files(PROMPT_LOG_S3_URI, start_date=log_start, end_date=log_end)
 
     if not files:
-        st.info(f"No log files found for {log_start} — {log_end}.")
-        with st.expander("🔧 Debug Info", expanded=True):
+        st.info(t("pl_no_files", start=log_start, end=log_end))
+        with st.expander(t("pl_debug_info"), expanded=True):
             bucket, prefix = _parse_s3_uri(PROMPT_LOG_S3_URI)
             st.markdown(f"- **S3 URI:** `{PROMPT_LOG_S3_URI}`")
             st.markdown(f"- **Bucket:** `{bucket}`")
@@ -449,7 +442,7 @@ def render_prompt_logging_page(apply_chart_theme_fn, chart_colors, theme_colors,
                 st.error(f"Error accessing S3: {e}")
         return
 
-    st.markdown(f"Found **{len(files)}** log files")
+    st.markdown(t("pl_found_files", count=len(files)))
 
     # ── Parse ──
     progress = st.progress(0, text="Parsing log files…")
@@ -486,18 +479,18 @@ def render_prompt_logging_page(apply_chart_theme_fn, chart_colors, theme_colors,
     st.markdown("---")
     m1, m2, m3, m4 = st.columns(4)
     with m1:
-        st.metric("Log Files", len(files))
+        st.metric(t("pl_log_files"), len(files))
     with m2:
-        st.metric("Inline Suggestions", total_inline)
+        st.metric(t("pl_inline_suggestions"), total_inline)
     with m3:
-        st.metric("Chat Messages", total_chat)
+        st.metric(t("pl_chat_messages"), total_chat)
     with m4:
         unique_users = set()
         if not df_inline.empty:
             unique_users.update(df_inline['userId'].unique())
         if not df_chat.empty:
             unique_users.update(df_chat['userId'].unique())
-        st.metric("Unique Users", len(unique_users))
+        st.metric(t("pl_unique_users"), len(unique_users))
 
     st.markdown("---")
 
@@ -511,9 +504,9 @@ def render_prompt_logging_page(apply_chart_theme_fn, chart_colors, theme_colors,
 
     # ── Tab navigation ──
     tab_chat, tab_inline, tab_ai_coding, tab_timeline, tab_raw = st.tabs([
-        "💬 Chat Conversations", "⚡ Inline Suggestions",
-        "🤖 AI Coding Acceptance", "📊 Activity Timeline",
-        "📋 Chat Conversations RAW Data"
+        t("pl_tab_chat"), t("pl_tab_inline"),
+        t("pl_tab_ai_coding"), t("pl_tab_timeline"),
+        t("pl_tab_raw")
     ])
 
     # ══════════════════════════════════════════════════════════════
@@ -571,7 +564,7 @@ def _render_model_top_chart(df_chat, apply_chart_theme_fn, chart_colors, theme_c
         model_counts.columns = ['modelId', 'messages']
         fig_model = px.bar(
             model_counts, x='messages', y='modelId', orientation='h',
-            title='Messages by Model',
+            title=t("pl_messages_by_model"),
             color='messages', color_continuous_scale='Blues',
             labels={'messages': 'Messages', 'modelId': 'Model'},
         )
@@ -608,7 +601,7 @@ def _render_model_top_chart(df_chat, apply_chart_theme_fn, chart_colors, theme_c
                            var_name='modelId', value_name='count'),
                 x='count', y='conversationId', color='modelId',
                 orientation='h', barmode='stack',
-                title='Top 10 Sessions — Model Breakdown',
+                title=t("pl_top10_sessions_model"),
                 labels={'count': 'Messages', 'conversationId': 'Session', 'modelId': 'Model'},
                 color_discrete_sequence=chart_colors,
             )
@@ -624,13 +617,13 @@ def _render_model_top_chart(df_chat, apply_chart_theme_fn, chart_colors, theme_c
     # Summary metrics row
     mc1, mc2, mc3 = st.columns(3)
     with mc1:
-        st.metric("Distinct Models", df['modelId'].nunique())
+        st.metric(t("pl_distinct_models"), df['modelId'].nunique())
     with mc2:
         top_model = model_counts.iloc[0]['modelId'] if not model_counts.empty else '—'
-        st.metric("Most Used Model", top_model)
+        st.metric(t("pl_most_used_model"), top_model)
     with mc3:
         auto_pct = (df['modelId'] == 'auto').sum() / max(len(df), 1) * 100
-        st.metric("Auto Mode %", f"{auto_pct:.1f}%")
+        st.metric(t("pl_auto_mode_pct"), f"{auto_pct:.1f}%")
 
 
 # ── Chat tab ────────────────────────────────────────────────────────
@@ -638,7 +631,7 @@ def _render_model_top_chart(df_chat, apply_chart_theme_fn, chart_colors, theme_c
 def _render_chat_tab(df_chat, search_query, apply_chart_theme_fn,
                      chart_colors, theme_colors, display_name_map):
     if df_chat.empty:
-        st.info("No chat log records found in the selected date range.")
+        st.info(t("pl_no_chat_records"))
         return
 
     df = df_chat.copy()
@@ -653,7 +646,7 @@ def _render_chat_tab(df_chat, search_query, apply_chart_theme_fn,
         )
         df = df[mask]
         if df.empty:
-            st.warning(f"No chat records match '{search_query}'")
+            st.warning(t("pl_no_match", query=search_query))
             return
 
     # ── Sidebar filters ──
@@ -666,12 +659,12 @@ def _render_chat_tab(df_chat, search_query, apply_chart_theme_fn,
 
     fc1, fc2, fc3 = st.columns(3)
     with fc1:
-        sel_user_label = st.selectbox("User", user_labels, key='chat_user_filter')
+        sel_user_label = st.selectbox(t("pl_user"), user_labels, key='chat_user_filter')
     with fc2:
         triggers = ['All'] + sorted(df['chatTriggerType'].dropna().unique().tolist())
-        sel_trigger = st.selectbox("Trigger Type", triggers, key='chat_trigger_filter')
+        sel_trigger = st.selectbox(t("pl_trigger_type"), triggers, key='chat_trigger_filter')
     with fc3:
-        st.metric("Conversations", df['conversationId'].nunique())
+        st.metric(t("pl_conversations"), df['conversationId'].nunique())
 
     if sel_user_label != 'All':
         sel_user_id = display_to_uid.get(sel_user_label, sel_user_label)
@@ -682,14 +675,14 @@ def _render_chat_tab(df_chat, search_query, apply_chart_theme_fn,
     st.markdown("---")
 
     # ── Model Usage Top Chart ──
-    st.subheader("🤖 Model Usage")
+    st.subheader(t("pl_model_usage"))
     _render_model_top_chart(df, apply_chart_theme_fn, chart_colors, theme_colors)
 
     st.markdown("---")
 
     # ── Session tree view ──
-    st.subheader("🗂️ Conversations by Session")
-    st.caption("Messages grouped by conversationId — expand to see the full dialogue")
+    st.subheader(t("pl_conversations_by_session"))
+    st.caption(t("pl_conversations_by_session_caption"))
 
     # Group by conversationId
     conversations = {}
@@ -708,12 +701,12 @@ def _render_chat_tab(df_chat, search_query, apply_chart_theme_fn,
     PAGE_SIZE = 10
     total_convos = len(sorted_convos)
     total_pages = max(1, (total_convos + PAGE_SIZE - 1) // PAGE_SIZE)
-    page = st.number_input("Page", min_value=1, max_value=total_pages, value=1,
+    page = st.number_input(t("pl_page"), min_value=1, max_value=total_pages, value=1,
                            key='chat_page') - 1
     start_idx = page * PAGE_SIZE
     page_convos = sorted_convos[start_idx:start_idx + PAGE_SIZE]
 
-    st.caption(f"Showing {start_idx+1}–{min(start_idx+PAGE_SIZE, total_convos)} of {total_convos} conversations")
+    st.caption(t("pl_showing", start=start_idx+1, end=min(start_idx+PAGE_SIZE, total_convos), total=total_convos))
 
     for cid, messages in page_convos:
         # Sort messages within conversation by timestamp ascending
@@ -1347,11 +1340,11 @@ def _guess_language_from_filename(filename):
 def _render_raw_data_tab(df_chat, theme_colors, display_name_map):
     """Render raw chat log data grouped by session with filters."""
 
-    st.markdown("#### 📋 Chat Conversations RAW Data")
-    st.caption("按 Session 展示原始日志数据，支持按 User、编程语言、RequestId、ModelId 过滤")
+    st.markdown(f"#### {t('pl_tab_raw')}")
+    st.caption(t("pl_conversations_by_session_caption"))
 
     if df_chat.empty:
-        st.info("No chat log records found in the selected date range.")
+        st.info(t("pl_no_chat_records"))
         return
 
     df = df_chat.copy()
